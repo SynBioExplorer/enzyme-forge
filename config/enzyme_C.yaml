@@ -1,0 +1,15 @@
+# =============================================================================
+# Enzyme C — Per-enzyme configuration
+# Pathway position: Step 3 (Intermediate₂ → Intermediate₃)
+# =============================================================================
+
+name: "Enzyme C"
+length: 348
+sequence_file: "inputs/sequences/enzyme_C.fasta"
+substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
+product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+
+fixed_residues: []
+hotspot_residues: []
+contigs: "A1-348"
+cofactors: []

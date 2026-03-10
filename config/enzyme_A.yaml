@@ -1,0 +1,24 @@
+# =============================================================================
+# Enzyme A — Per-enzyme configuration
+# Pathway position: Entry (Substrate₁ → Intermediate₁)
+# =============================================================================
+
+name: "Enzyme A"
+length: 428
+sequence_file: "inputs/sequences/enzyme_A.fasta"
+substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
+product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+
+# Catalytic residues to keep fixed during LigandMPNN design
+fixed_residues: []
+
+# Active site residues for RFdiffusion3 hotspot focusing
+hotspot_residues: []
+
+# RFdiffusion3 contig specification
+# Format: fixed-region / gap / fixed-region
+# Example: "A1-50/0 10-20/A51-428"
+contigs: "A1-428"
+
+# Cofactors present in the active site (SMILES or common names)
+cofactors: []

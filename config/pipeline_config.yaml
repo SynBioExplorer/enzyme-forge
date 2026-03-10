@@ -1,0 +1,146 @@
+# =============================================================================
+# Enzyme Engineering Pipeline — Global Configuration
+# =============================================================================
+
+global:
+  project_name: "enzyme_pathway_optimisation"
+  base_dir: "/data/enzyme_pipeline"
+  log_dir: "logs"
+  results_dir: "results"
+  round_number: 1
+
+# ---------------------------------------------------------------------------
+# Database paths (pre-indexed on local NVMe)
+# ---------------------------------------------------------------------------
+databases:
+  colabfold_db_dir: "/data/enzyme_pipeline/inputs/databases/colabfold"
+  mmseqs2_db_dir: "/data/enzyme_pipeline/inputs/databases/mmseqs2"
+  uniref30_db: "/data/enzyme_pipeline/inputs/databases/colabfold/uniref30_2302"
+  colabfolddb: "/data/enzyme_pipeline/inputs/databases/colabfold/colabfolddb_2021_08"
+
+# ---------------------------------------------------------------------------
+# Tool environments / installation paths
+# ---------------------------------------------------------------------------
+tools:
+  boltz2_env: "/opt/conda/envs/boltz2"
+  ligandmpnn_dir: "/opt/tools/LigandMPNN"
+  esmfold_env: "/opt/conda/envs/esmfold"
+  rfdiffusion3_foundry_bin: "/opt/tools/foundry/bin/foundry"
+  colabfold_env: "/opt/conda/envs/colabfold"
+  protenix_env: "/opt/conda/envs/protenix"
+
+# ---------------------------------------------------------------------------
+# Per-stage parameters and output directories
+# ---------------------------------------------------------------------------
+stages:
+  stage_00_bottleneck:
+    output_dir: "stage_00_bottleneck"
+    fcc_threshold: 0.3
+
+  stage_01_msa:
+    output_dir: "stage_01_msa"
+
+  stage_02_wt_structures:
+    output_dir: "stage_02_wt_structures"
+    boltz2_seeds: 5
+    recycling_iterations: 10
+
+  stage_03_rfdiffusion3:
+    output_dir: "stage_03_rfdiffusion3"
+    partial_T_conservative: 10
+    partial_T_standard: 15
+    partial_T_aggressive: 20
+    designs_primary: 500
+    designs_secondary: 200
+
+  stage_04_ligandmpnn:
+    output_dir: "stage_04_ligandmpnn"
+    temperature_primary: 0.1
+    temperature_exploratory: 0.2
+    temperature_wt_high: 0.4
+    number_of_batches: 16
+    omit_aa: "C"
+    pack_side_chains: true
+    pack_with_ligand_context: true
+
+  stage_04_5_fitness:
+    output_dir: "stage_04.5_fitness_scores"
+
+  stage_05_esmfold:
+    output_dir: "stage_05_esmfold_prescreen"
+    plddt_hard_floor: 60
+    ca_rmsd_max: 5.0
+
+  stage_06_boltz2_screening:
+    output_dir: "stage_06_boltz2_screening"
+    ca_rmsd_max: 2.0
+    active_site_rmsd_max: 1.5
+    ligand_rmsd_max: 2.0
+
+  stage_06_5_md:
+    output_dir: "stage_06.5_md_simulations"
+    enabled: false
+    simulation_ns: 20
+    top_n_candidates: 200
+
+  stage_07_crossval:
+    output_dir: "stage_07_crossval_ranking"
+    top_n_candidates: 200
+    protenix_ca_rmsd_agreement: 2.0
+
+  stage_07_5_glycosylation:
+    output_dir: "stage_07.5_glycosylation"
+
+  stage_08_codon_opt:
+    output_dir: "stage_08_codon_opt"
+    target_gc_min: 0.35
+    target_gc_max: 0.45
+    min_cai: 0.7
+
+# ---------------------------------------------------------------------------
+# Enzyme definitions (inline or reference to per-enzyme YAML)
+# ---------------------------------------------------------------------------
+enzymes:
+  enzyme_A:
+    name: "Enzyme A"
+    length: 428
+    sequence_file: "inputs/sequences/enzyme_A.fasta"
+    substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
+    product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+    fixed_residues: []
+    hotspot_residues: []
+    contigs: "A1-428"
+    cofactors: []
+
+  enzyme_B:
+    name: "Enzyme B"
+    length: 512
+    sequence_file: "inputs/sequences/enzyme_B.fasta"
+    substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
+    product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+    fixed_residues: []
+    hotspot_residues: []
+    contigs: "A1-512"
+    cofactors: []
+
+  enzyme_C:
+    name: "Enzyme C"
+    length: 348
+    sequence_file: "inputs/sequences/enzyme_C.fasta"
+    substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
+    product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+    fixed_residues: []
+    hotspot_residues: []
+    contigs: "A1-348"
+    cofactors: []
+
+  enzyme_D:
+    name: "Enzyme D"
+    length: 295
+    sequence_file: "inputs/sequences/enzyme_D.fasta"
+    substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
+    product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+    fixed_residues: []
+    hotspot_residues: []
+    contigs: "A1-295"
+    cofactors: []

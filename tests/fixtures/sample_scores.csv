@@ -1,0 +1,6 @@
+sequence_id,plddt,rmsd
+EnzymeA_WT,92.5,0.0
+EnzymeA_V1,88.3,1.2
+EnzymeA_V2,85.1,2.4
+EnzymeB_WT,90.7,0.0
+EnzymeB_V1,87.9,1.8

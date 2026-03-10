@@ -1,0 +1,15 @@
+# =============================================================================
+# Enzyme B — Per-enzyme configuration
+# Pathway position: Step 2 (Intermediate₁ → Intermediate₂)
+# =============================================================================
+
+name: "Enzyme B"
+length: 512
+sequence_file: "inputs/sequences/enzyme_B.fasta"
+substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
+product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+
+fixed_residues: []
+hotspot_residues: []
+contigs: "A1-512"
+cofactors: []
