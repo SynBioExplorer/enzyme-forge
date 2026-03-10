@@ -319,6 +319,150 @@ def design_wt_branch(
 
 
 # ---------------------------------------------------------------------------
+# MMseqs2 diversity clustering
+# ---------------------------------------------------------------------------
+
+def cluster_sequences(
+    fasta_path: Path,
+    output_dir: Path,
+    identity: float = 0.9,
+    threads: int = 24,
+) -> dict[str, str]:
+    """Cluster sequences with MMseqs2 easy-cluster and return cluster representatives.
+
+    Runs ``mmseqs easy-cluster`` at the given sequence identity threshold.
+    After clustering, reads the ``*_rep_seq.fasta`` file produced by MMseqs2
+    and returns only the representative sequences as a ``{header: sequence}`` dict.
+
+    Args:
+        fasta_path: Path to the input FASTA file.
+        output_dir: Directory for MMseqs2 outputs (a ``cluster_result`` prefix is
+            used internally).
+        identity: Minimum sequence identity threshold (default 0.9 = 90 %).
+        threads: Number of CPU threads for MMseqs2 (default 24).
+
+    Returns:
+        Dict mapping sequence header to sequence for each cluster representative.
+
+    Raises:
+        RuntimeError: If the MMseqs2 command exits with a non-zero return code.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    result_prefix = str(output_dir / "cluster_result")
+    tmp_dir = str(output_dir / "mmseqs_tmp")
+
+    cmd = [
+        "mmseqs", "easy-cluster",
+        str(fasta_path),
+        result_prefix,
+        tmp_dir,
+        "--min-seq-id", str(identity),
+        "--threads", str(threads),
+    ]
+
+    logger.info("Running MMseqs2 clustering: %s", " ".join(cmd))
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"MMseqs2 clustering failed (exit {result.returncode}):\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+    # MMseqs2 writes representatives to <prefix>_rep_seq.fasta
+    rep_fasta = Path(f"{result_prefix}_rep_seq.fasta")
+
+    representatives: dict[str, str] = {}
+    if rep_fasta.exists():
+        representatives = read_fasta(rep_fasta)
+    else:
+        # Graceful fallback: if the representative file is unexpectedly absent,
+        # return the original sequences so pipeline does not silently lose data.
+        logger.warning(
+            "MMseqs2 representative FASTA not found at %s; "
+            "returning original sequences as fallback",
+            rep_fasta,
+        )
+        representatives = read_fasta(fasta_path)
+
+    n_input = sum(1 for _ in open(fasta_path) if _.startswith(">"))
+    n_clusters = len(representatives)
+    reduction = 1.0 - n_clusters / n_input if n_input > 0 else 0.0
+    logger.info(
+        "MMseqs2 clustering: %d → %d representatives (%.1f %% reduction)",
+        n_input, n_clusters, reduction * 100,
+    )
+
+    return representatives
+
+
+# ---------------------------------------------------------------------------
+# TS conditioning branch (Branch C)
+# ---------------------------------------------------------------------------
+
+def design_ts_branch(
+    ts_pdb: Path,
+    enzyme_id: str,
+    enzyme_config: dict[str, Any],
+    output_dir: Path,
+    n_sequences_per_temp: int,
+    ligandmpnn_dir: Path,
+) -> list[dict[str, Any]]:
+    """Run LigandMPNN on the TS complex structure at WT_TEMPERATURES.
+
+    This is an additive branch: it generates sequences conditioned on the
+    transition-state (TS) complex from Stage 2, using the same temperature
+    sweep as the WT diversification branch.
+
+    Args:
+        ts_pdb: Path to the TS complex PDB from Stage 2.
+        enzyme_id: Enzyme identifier.
+        enzyme_config: Enzyme configuration dict (used for fixed_residues).
+        output_dir: Base output directory for this branch.
+        n_sequences_per_temp: Number of sequences to generate per temperature.
+        ligandmpnn_dir: LigandMPNN installation directory.
+
+    Returns:
+        List of sequence record dicts, each tagged with
+        ``design_branch = "ts_conditioned"``.
+    """
+    fixed_residues = enzyme_config.get("fixed_residues", [])
+    all_records: list[dict[str, Any]] = []
+
+    for temp in WT_TEMPERATURES:
+        n_batches = n_sequences_per_temp
+        temp_dir = output_dir / f"{enzyme_id}_ts_T{temp}"
+
+        try:
+            fasta_path, scores_path = run_ligandmpnn(
+                pdb_path=ts_pdb,
+                output_dir=temp_dir,
+                temperature=temp,
+                n_batches=n_batches,
+                fixed_residues=fixed_residues,
+                ligandmpnn_dir=ligandmpnn_dir,
+                seed=int(temp * 1000) + 1,
+            )
+            records = _parse_ligandmpnn_output(
+                fasta_path, scores_path, temp, f"{enzyme_id}_ts",
+            )
+            for r in records:
+                r["design_branch"] = "ts_conditioned"
+                r["enzyme_id"] = enzyme_id
+            all_records.extend(records)
+        except RuntimeError as exc:
+            logger.error(
+                "LigandMPNN TS branch failed for %s at T=%s: %s",
+                enzyme_id, temp, exc,
+            )
+
+    return all_records
+
+
+# ---------------------------------------------------------------------------
 # Deduplication
 # ---------------------------------------------------------------------------
 
@@ -381,6 +525,7 @@ def run_stage(config: dict[str, Any]) -> dict[str, Any]:
     n_batches = stage_cfg.get("number_of_batches", 16)
     omit_aa = stage_cfg.get("omit_aa", "C")
     wt_seqs_per_temp = stage_cfg.get("wt_sequences_per_temp", WT_SEQS_PER_TEMP)
+    clustering_identity: float | None = stage_cfg.get("clustering_identity", None)
 
     # Input directories
     backbone_dir = base_dir / config.get("stages", {}).get(
@@ -456,9 +601,73 @@ def run_stage(config: dict[str, Any]) -> dict[str, Any]:
                 "%s Branch B: WT PDB not found — skipping", enzyme_id,
             )
 
+        # ----- Branch C: TS conditioning (optional, additive) -----
+        if enzyme_cfg.get("ts_smiles"):
+            ts_pdb = wt_dir / "ts_complexes" / f"{enzyme_id}_ts.pdb"
+            if ts_pdb.exists():
+                logger.info(
+                    "%s Branch C: TS complex PDB = %s", enzyme_id, ts_pdb,
+                )
+                ts_records = design_ts_branch(
+                    ts_pdb=ts_pdb,
+                    enzyme_id=enzyme_id,
+                    enzyme_config=enzyme_cfg,
+                    output_dir=enzyme_out_dir / "branch_c",
+                    n_sequences_per_temp=wt_seqs_per_temp,
+                    ligandmpnn_dir=ligandmpnn_dir,
+                )
+                enzyme_records.extend(ts_records)
+                logger.info(
+                    "%s Branch C: %d TS-conditioned sequences generated",
+                    enzyme_id, len(ts_records),
+                )
+            else:
+                logger.warning(
+                    "%s Branch C: ts_smiles present but TS complex PDB not found at %s"
+                    " — skipping TS conditioning",
+                    enzyme_id, ts_pdb,
+                )
+
         # ----- Merge and deduplicate -----
         enzyme_records = deduplicate_sequences(enzyme_records)
         per_enzyme[enzyme_id] = len(enzyme_records)
+
+        # ----- MMseqs2 diversity clustering (optional) -----
+        if clustering_identity is not None and enzyme_records:
+            pre_cluster_fasta = enzyme_out_dir / f"{enzyme_id}_pre_cluster.fasta"
+            pre_cluster_seqs = {r["sequence_id"]: r["sequence"] for r in enzyme_records}
+            write_fasta(pre_cluster_seqs, pre_cluster_fasta)
+
+            representatives = cluster_sequences(
+                fasta_path=pre_cluster_fasta,
+                output_dir=enzyme_out_dir / "mmseqs_cluster",
+                identity=clustering_identity,
+            )
+
+            # Keep only records for representative sequences
+            rep_ids = set(representatives.keys())
+            enzyme_records = [r for r in enzyme_records if r["sequence_id"] in rep_ids]
+
+            # For any representative not already in enzyme_records (header mismatch
+            # or fallback path), add a minimal synthetic record so no sequence is lost.
+            existing_ids = {r["sequence_id"] for r in enzyme_records}
+            for rep_id, rep_seq in representatives.items():
+                if rep_id not in existing_ids:
+                    enzyme_records.append({
+                        "sequence": rep_seq,
+                        "sequence_id": rep_id,
+                        "score": 0.0,
+                        "temperature": 0.0,
+                        "backbone": "clustered_representative",
+                        "enzyme_id": enzyme_id,
+                        "design_branch": "clustered_representative",
+                    })
+
+            per_enzyme[enzyme_id] = len(enzyme_records)
+            logger.info(
+                "%s: %d sequences after MMseqs2 clustering (identity %.0f%%)",
+                enzyme_id, len(enzyme_records), clustering_identity * 100,
+            )
 
         # Write enzyme FASTA
         fasta_seqs = {

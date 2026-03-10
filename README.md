@@ -8,196 +8,191 @@ EnzymeForge chains state-of-the-art protein design tools (Boltz-2, RFdiffusion3,
 
 ## Pipeline Overview
 
-The pipeline takes 4 wild-type enzyme sequences through 12 stages of computational design, screening, and optimization, producing 48-96 synthesis-ready DNA sequences per enzyme in ~7-8 days on one NVIDIA RTX 6000 Pro (96 GB VRAM).
+The pipeline takes wild-type enzyme sequences through 14 stages of computational design, screening, and optimization, producing 48-96 synthesis-ready DNA sequences per enzyme. With Boltz-2 NIM (TensorRT-compiled) and the optimized funnel, total runtime is **~2-3 days** on one NVIDIA RTX 6000 Pro (96 GB VRAM).
 
 | Stage | Module | What it does | GPU/CPU | Time |
 |-------|--------|-------------|---------|------|
-| 0 | `stage0_bottleneck.py` | Identifies which enzymes limit pathway flux using flux balance analysis, so GPU time is spent on the right targets | CPU | ~1 day |
-| 1 | `stage1_msa.py` | Generates multiple sequence alignments to capture evolutionary information needed by downstream predictors | GPU | ~40s |
-| 2 | `stage2_wt_structures.py` | Predicts 3D structures of each enzyme bound to its substrate and product, providing the scaffolds for all design | GPU | ~20 min |
-| 3 | `stage3_rfdiffusion3.py` | Creates diverse backbone conformations around the active site while preserving the global fold — the generative core of the pipeline | GPU | ~7 hrs |
-| 4 | `stage4_ligandmpnn.py` | Designs amino acid sequences for each backbone that are compatible with substrate binding — converts structures to sequences | GPU | ~16 hrs |
-| 4.5 | `stage4_5_fitness.py` | Scores all sequences for evolutionary plausibility using three complementary predictors — catches designs that "look wrong" to evolution | CPU/GPU | ~30 min |
-| 5 | `stage5_esmfold.py` | Rapidly predicts structure from sequence alone to eliminate clearly misfolded designs before expensive screening | GPU | ~5.3 hrs |
-| 6 | `stage6_boltz2_screen.py` | Full structural screening: docks each variant with substrate AND product to assess both binding and product inhibition risk | GPU | ~5 days |
-| 6.5 | `stage6_5_md.py` | *Optional.* Runs molecular dynamics simulations to filter for conformational stability — catches designs that fold but can't catalyze | GPU | 4-8 days |
-| 7 | `stage7_ranking.py` | Cross-validates top candidates with an independent predictor (Protenix-v1) and ranks by Pareto front across all metrics | GPU | ~7 hrs |
-| 7.5 | `stage7_5_glycosylation.py` | Screens for N-glycosylation sites that yeast would modify, which can destroy enzyme activity | CPU | seconds |
-| 8 | `stage8_codon_opt.py` | Converts protein sequences to yeast-optimized DNA, removes restriction sites, and generates 96-well plate maps for ordering | CPU | ~2 hrs |
+| 0 | `stage0_bottleneck.py` | **Optional.** Identifies which enzymes limit pathway flux using thermodynamic FBA. When disabled (default), all enzymes are optimized equally | CPU | ~1 day |
+| 1 | `stage1_msa.py` | Generates multiple sequence alignments via ColabFold + MMseqs2-GPU (~10s/enzyme on RTX 6000 Pro with Blackwell DPX kernels) | GPU | ~40s |
+| 2 | `stage2_wt_structures.py` | Predicts 3D structures of each enzyme bound to substrate, product, and optional transition state analogue | GPU | ~20 min |
+| 3 | `stage3_rfdiffusion3.py` | Creates ~5,000 diverse backbone conformations around the active site while preserving the global fold | GPU | ~20 hrs |
+| 4 | `stage4_ligandmpnn.py` | Designs amino acid sequences for each backbone, optionally conditioning on transition state geometry. MMseqs2 clustering at 90% identity removes near-duplicates | GPU | ~16 hrs |
+| 4.5 | `stage4_5_fitness.py` | Scores all sequences for evolutionary plausibility using TranceptEVE + ESM-2 + GEMME ensemble | CPU/GPU | ~30 min |
+| 4.75 | `stage4_75_solubility.py` | **New.** Physics-based solubility pre-screen (CamSol-like intrinsic solubility, net charge, aggregation-prone regions). Flags likely-insoluble variants before expensive screening | CPU | ~5 min |
+| 5 | `stage5_esmfold.py` | Batch ESMFold inference (bf16) with pre-ranking gate — passes only top N sequences to Stage 6 based on pLDDT + fitness composite | GPU | ~2 hrs |
+| 6 | `stage6_boltz2_screen.py` | 3-way docking: substrate + product + transition state. Boltz-2 NIM (TRT) at 6.8s/inference. Incremental checkpointing for crash recovery | GPU | ~7-19 hrs |
+| 6.5 | `stage6_5_md.py` | *Optional.* Gaussian accelerated MD (GaMD) for enhanced conformational sampling — captures dynamics that classical 20ns MD misses | GPU | 4-8 days |
+| 7 | `stage7_ranking.py` | Cross-validates with Protenix-v1; Pareto-front ranking across 10 metrics including TS affinity and solubility | GPU | ~7 hrs |
+| 7.5 | `stage7_5_glycosylation.py` | Screens for N-glycosylation sequons that yeast would modify, offers Asn->Gln substitutions | CPU | seconds |
+| 8 | `stage8_codon_opt.py` | Codon optimization for *S. cerevisiae* with expression-hedging 96-well plate maps (WT controls, risk-stratified layout) | CPU | ~2 hrs |
 
-**Total: ~7-8 days** (without MD) | **Fast-track: ~3 days** (skip backbone diversification) | **With MD: ~12-16 days**
+**Total: ~2-3 days** (NIM + funnel) | **Without NIM: ~5-6 days** | **With MD: ~10-14 days**
 
 ### Pipeline DAG
 
 ```
-Stage 0: Bottleneck ID ──► Which enzymes to prioritize
+Stage 0: Bottleneck ID (optional) ──► Enzyme priority
     │
 Stage 1: MSA Generation ──────────────────────────────────┐
     │                                                       │
-Stage 2: WT Structure Prediction (substrate + product)      │
+Stage 2: WT Structure Prediction (substrate+product+TS)     │
     │                                                       │
     ├──────────────────────┬────────────────────┐           │
     │ Stage 3: RFdiffusion3│ Stage 4b: Direct   │           │
     │ backbone generation  │ LigandMPNN on WT   │           │
-    │                      │                    │           │
+    │ (~5,000 backbones)   │                    │           │
     └──────────┬───────────┴─────────┬──────────┘           │
                │                     │                      │
-         Stage 4a: LigandMPNN  ◄─── merge                  │
-               │                                            │
+         Stage 4a: LigandMPNN ◄──── merge                   │
+               │ + MMseqs2 clustering (90% identity)        │
                └──────► Stage 4.5: Zero-shot fitness        │
                               │                             │
-                    Stage 5: ESMFold pre-screen              │
+                    Stage 4.75: Solubility pre-screen        │
                               │                             │
-                    Stage 6: Boltz-2 screening  ◄───────────┘
+                    Stage 5: ESMFold + pre-ranking gate      │
+                              │ (top 5,000 → Stage 6)       │
+                    Stage 6: Boltz-2 3-way docking ◄────────┘
+                              │ (substrate + product + TS)
+                    Stage 6.5: GaMD simulations (optional)
                               │
-                    Stage 6.5: MD simulations (optional)
-                              │
-                    Stage 7: Protenix-v1 cross-val + Pareto ranking
+                    Stage 7: Protenix-v1 + Pareto ranking
                               │
                     Stage 7.5: N-glycosylation screening
                               │
-                    Stage 8: Codon optimization + plate maps
+                    Stage 8: Codon opt + hedging plate maps
 ```
+
+---
+
+## v0.3 Improvements
+
+Changes from v0.2 based on critical review and Didi et al. (2025) benchmarks:
+
+| Improvement | What changed | Impact |
+|-------------|-------------|--------|
+| **Transition state docking** | 3-way docking (substrate + product + TS) instead of 2-way; TS affinity as Pareto metric | Better catalytic variant selection — enzymes stabilize TS, not substrate |
+| **Solubility pre-screen** | New Stage 4.75 with CamSol-like physics-based scoring | Catches aggregation-prone variants before expensive screening |
+| **Scaled funnel** | 2,000-5,000 backbones (up from 1,600); MMseqs2 clustering at 90% identity | More diversity in, less redundancy through |
+| **Pre-ranking gate** | Stage 5 ranks by pLDDT + fitness, passes only top 5,000 to Stage 6 | Stage 6 compute cut by 60-80% |
+| **Boltz-2 NIM** | TensorRT-compiled inference: 6.8s vs 18s per structure on RTX 6000 Pro | 2.6x faster Stage 6 (Didi et al. 2025) |
+| **BF16 inference** | Autocast bf16 for ESMFold, validated by Didi et al. (no accuracy loss) | 2x throughput, halved VRAM |
+| **Incremental checkpointing** | Stage 6 saves every 200 sequences; resume after crash | No more lost progress on multi-day runs |
+| **GaMD enhanced sampling** | Gaussian accelerated MD replaces classical MD in Stage 6.5 | Captures conformational dynamics in shorter simulations |
+| **Stage 0 optional** | FBA bottleneck ID is opt-in (default: optimize all enzymes equally) | Simpler startup; FBA available when kinetic data exists |
+| **TFBA + ensemble FBA** | Thermodynamic FBA (eQuilibrator) and ensemble parameter sampling | More realistic flux estimates than basic FBA |
+| **Expression-hedging plates** | WT controls in A1/H12; risk-stratified rows (conservative/moderate/aggressive) | Maximizes experimental information per plate |
 
 ---
 
 ## Why These Tools?
 
-Every tool was selected for three criteria: **accuracy on relevant benchmarks**, **commercial usability** (MIT/BSD/Apache 2.0), and **single-GPU feasibility** (96 GB VRAM).
+Every tool was selected for: **accuracy on relevant benchmarks**, **commercial usability** (MIT/BSD/Apache 2.0), and **single-GPU feasibility** (96 GB VRAM).
 
 | Tool | Role | Why this one? | License |
 |------|------|---------------|---------|
-| **Boltz-2** | Structure prediction + binding affinity | Best open-source complex predictor; handles protein-ligand-cofactor systems in one pass; MIT license | MIT |
-| **RFdiffusion3** | Backbone generation | 10x faster than RFdiffusion v1; all-atom representation; 90% win rate on 41 active-site benchmarks; 18% experimental success rate | BSD-3 |
-| **LigandMPNN** | Sequence design | Only inverse folding model that conditions on bound ligands — critical for enzymes where the substrate shapes the active site | MIT |
-| **ESMFold** | Fast pre-screening | ~1s/sequence structure prediction; no MSA needed; AUC 0.72 for discriminating design success (better than Boltz pLDDT's 0.60) | MIT |
-| **Protenix-v1** | Cross-validation | First fully open model to outperform AlphaFold3; independent from Boltz-2 (different architecture = orthogonal validation) | Apache 2.0 |
-| **TranceptEVE** | Fitness prediction | Best single zero-shot predictor on ProteinGym benchmark (Spearman ~0.46-0.50 with experimental fitness) | MIT |
-| **ESM-2** | Fitness prediction | Complementary protein language model signal; log-likelihood correlates with fitness | MIT |
-| **GEMME** | Fitness prediction | Fast MSA-based conservation scoring; strong on non-human proteins; adds evolutionary signal without GPU cost | MIT |
-| **OpenMM** | MD simulations | GPU-accelerated; mature force fields (AMBER ff14SB); Python-native API; >1 ns/day on RTX 6000 | MIT |
-| **CatPred** | Kinetics prediction | Predicts kcat, Km, Ki from sequence — provides catalytic activity estimates beyond structural metrics | MIT |
-| **COBRApy** | Flux analysis | Standard tool for genome-scale metabolic modeling; integrates with yeast-GEM | GPL-2.0 |
-| **MMseqs2-GPU** | MSA generation | GPU-accelerated homology search; eliminates API rate limiting by running locally | MIT |
+| **Boltz-2 (+ NIM)** | Structure prediction + binding affinity | Best open-source complex predictor; TRT-compiled NIM = 6.8s/inference on RTX 6000 Pro | MIT |
+| **RFdiffusion3** | Backbone generation | 10x faster than v1; all-atom; 90% win rate on 41 active-site benchmarks; 18% experimental success rate | BSD-3 |
+| **LigandMPNN** | Sequence design | Only inverse folding model that conditions on bound ligands — critical for enzymes | MIT |
+| **ESMFold** | Fast pre-screening | ~1s/seq (bf16 batch); AUC 0.72 for design success discrimination | MIT |
+| **Protenix-v1** | Cross-validation | First open model to outperform AlphaFold3; orthogonal to Boltz-2 | Apache 2.0 |
+| **TranceptEVE** | Fitness prediction | Best single zero-shot predictor on ProteinGym (Spearman ~0.46-0.50) | MIT |
+| **ESM-2** | Fitness prediction | Complementary PLM signal; log-likelihood correlates with fitness | MIT |
+| **GEMME** | Fitness prediction | Fast MSA-based conservation; strong on non-human proteins | MIT |
+| **OpenMM** | MD simulations (GaMD) | GPU-accelerated; AMBER ff14SB; Python API; GaMD for enhanced sampling | MIT |
+| **CatPred** | Kinetics prediction | Predicts kcat, Km, Ki from sequence | MIT |
+| **MMseqs2-GPU** | MSA generation | GPU-accelerated; Blackwell DPX kernels; 10s/query on RTX 6000 Pro | MIT |
 
 ### Why Not AlphaFold3 / ESM-3?
 
 - **AlphaFold3**: Non-commercial license. Boltz-2 achieves comparable accuracy with MIT license.
-- **ESM-3**: No ligand awareness (can't condition on substrates), scTM=0.486 vs RFdiffusion's 0.945 for designability, non-commercial license for useful model sizes.
+- **ESM-3**: No ligand awareness (can't condition on substrates), scTM=0.486 vs RFdiffusion's 0.945, non-commercial license for useful model sizes.
 
 ---
 
 ## Design Decisions Explained
 
-### Softened pLDDT Filtering (Stages 5-6)
-Garcia et al. (*Protein Science* 2025) showed pLDDT has AUC of only 0.60 for predicting design success — barely better than random. Active sites are often in dynamic regions where pLDDT is inherently low. We use pLDDT > 60 as a floor (catch clearly misfolded) rather than a hard gate, and pass pLDDT as a continuous score to Pareto ranking.
+### Ground State vs. Transition State (Stage 4 + 6)
+Enzymes catalyze by stabilizing the transition state (TS), not the substrate ground state. Over-optimizing for substrate affinity creates a thermodynamic sink. We optionally dock against TS analogues (via `ts_smiles` in config) alongside substrate/product, and include TS affinity in Pareto ranking.
+
+### Softened pLDDT Filtering (Stage 5)
+Garcia et al. (*Protein Science* 2025) showed pLDDT has AUC of only 0.60 for predicting design success. We use pLDDT > 60 as a floor and pass it as a continuous score to Pareto ranking.
+
+### Solubility Pre-screening (Stage 4.75)
+Expression failure is the #1 real-world failure mode for heterologous enzyme designs. CamSol-like physics-based scoring (no ML domain shift from E. coli to yeast) flags aggregation-prone variants before expensive Boltz-2 screening.
 
 ### Product Inhibition Screening (Stage 6)
-Pathway enzymes accumulate local product, which can inhibit catalysis. We dock each variant with both substrate and product SMILES, then rank by the substrate/product affinity ratio. Variants where product binds more tightly than substrate are flagged.
+Pathway enzymes accumulate local product. We dock each variant with substrate AND product SMILES, ranking by substrate/product affinity ratio.
 
-### Pareto Ranking Instead of Weighted Scoring (Stage 7)
-The v0.1 composite score (0.2x pLDDT + 0.3x RMSD + 0.3x affinity + 0.2x LigandMPNN) had no evidence base. Boltz-2 affinity poorly correlates with catalytic activity (R~0.57). We rank by Pareto front across 7-8 metrics in Round 1 (no a priori weights), then learn weights from experimental data in Round 2.
+### GaMD Enhanced Sampling (Stage 6.5)
+Classical 20ns MD only captures side-chain relaxation. GaMD applies a harmonic boost potential to smooth the energy landscape, enabling observation of loop closures and domain motions within short simulations.
 
-### N-Glycosylation Screening (Stage 7.5)
-*S. cerevisiae* hyperglycosylates heterologous proteins at Asn-Xaa-Ser/Thr sequons. Sequons near the active site (<10 A) can destroy activity. We screen and offer Asn->Gln substitutions.
+### Pareto Ranking (Stage 7)
+No arbitrary weights. Round 1: rank by Pareto front across 10 metrics. Round 2+: learn weights from experimental data via GP regression.
 
-### Zero-Shot Fitness Ensemble (Stage 4.5)
-ProteinGym benchmarks show that ensembles across modalities outperform single large models, and scaling pLMs beyond 4B parameters doesn't help. We combine three orthogonal signals: autoregressive (TranceptEVE), language model (ESM-2), and conservation-based (GEMME).
+### Expression-Hedging Plate Layout (Stage 8)
+Wells A1/H12: WT controls. Rows A-B: conservative variants (fewest mutations). Rows G-H: aggressive variants. Middle rows: moderate risk. Maximizes information gain per plate.
 
-### Local MSA Database
-ColabFold's public API has rate limits. By downloading and indexing the full ColabFoldDB (~1.2 TB) + UniRef30 locally on NVMe, MSA generation runs in seconds without throttling.
+### Funnel Optimization
+The v0.2 pipeline spent 66% of compute (Stage 6) evaluating 12,000 sequences of which 98.3% were discarded. v0.3 fixes this with: (1) MMseqs2 clustering at 90% identity, (2) pre-ranking gate passing only top 5,000 to Stage 6, (3) Boltz-2 NIM at 2.6x speed. Result: Stage 6 drops from ~5 days to ~7-19 hours.
 
 ---
 
 ## Installation
 
 ### Prerequisites
-- NVIDIA GPU with >= 48 GB VRAM (96 GB recommended)
-- CUDA >= 12.4
+- NVIDIA GPU with >= 48 GB VRAM (96 GB recommended, Blackwell architecture for DPX kernels)
+- CUDA >= 12.4 (13.0 for TensorRT)
 - Python 3.10-3.11
 - Conda/Mamba
 
 ### Setup
 
 ```bash
-# Clone
-git clone https://github.com/your-username/enzyme-forge.git
+git clone https://github.com/SynBioExplorer/enzyme-forge.git
 cd enzyme-forge
 
-# Install base dependencies
 pip install pyyaml jsonschema pandas biopython numpy
 
-# Download and index MSA databases (~1.4 TB, run once)
+# Download MSA databases (~1.4 TB, run once)
 python -m pipeline.setup_databases --config config/pipeline_config.yaml --db-dir /data/databases
-
-# Install each tool in its own conda environment (see pipeline-tech-reqs.md for versions)
-# Boltz-2, RFdiffusion3, LigandMPNN, ESMFold, Protenix-v1, etc.
 ```
 
 ---
 
 ## Usage
 
-Every stage is invoked the same way — all parameters come from the YAML config:
+Every stage is invoked the same way:
 
 ```bash
 python -m pipeline.<stage_module> --config config/pipeline_config.yaml
 ```
 
-### Running the Full Pipeline
+### Full Pipeline
 
 ```bash
-# 1. Download databases (one-time, ~1.4 TB)
-python -m pipeline.setup_databases --config config/pipeline_config.yaml
-
-# 2. Identify bottleneck enzymes
+# 0. (Optional) Bottleneck ID — set enabled: true in config first
 python -m pipeline.stage0_bottleneck --config config/pipeline_config.yaml
 
-# 3. Generate MSAs
+# 1-2. MSA + WT structures
 python -m pipeline.stage1_msa --config config/pipeline_config.yaml
-
-# 4. Predict wild-type structures (substrate + product complexes)
 python -m pipeline.stage2_wt_structures --config config/pipeline_config.yaml
 
-# 5. Generate diverse backbones
+# 3-4. Design
 python -m pipeline.stage3_rfdiffusion3 --config config/pipeline_config.yaml
-
-# 6. Design sequences
 python -m pipeline.stage4_ligandmpnn --config config/pipeline_config.yaml
 
-# 7. Zero-shot fitness scoring
+# 4.5-4.75. Fitness + solubility scoring
 python -m pipeline.stage4_5_fitness --config config/pipeline_config.yaml
+python -m pipeline.stage4_75_solubility --config config/pipeline_config.yaml
 
-# 8. Pre-screen with ESMFold
+# 5-6. Screen (Stage 5 pre-ranks, Stage 6 does full Boltz-2 + TS docking)
 python -m pipeline.stage5_esmfold --config config/pipeline_config.yaml
-
-# 9. Full structural screening + product inhibition
 python -m pipeline.stage6_boltz2_screen --config config/pipeline_config.yaml
 
-# 10. (Optional) MD simulations
+# 6.5. (Optional) GaMD simulations
 python -m pipeline.stage6_5_md --config config/pipeline_config.yaml
 
-# 11. Cross-validate and rank
-python -m pipeline.stage7_ranking --config config/pipeline_config.yaml
-
-# 12. N-glycosylation screening
-python -m pipeline.stage7_5_glycosylation --config config/pipeline_config.yaml
-
-# 13. Codon optimization + plate maps
-python -m pipeline.stage8_codon_opt --config config/pipeline_config.yaml
-```
-
-### Fast-Track Mode (~3 days)
-
-Skip backbone diversification — run LigandMPNN directly on wild-type structures:
-
-```bash
-python -m pipeline.stage1_msa --config config/pipeline_config.yaml
-python -m pipeline.stage2_wt_structures --config config/pipeline_config.yaml
-python -m pipeline.stage4_ligandmpnn --config config/pipeline_config.yaml  # uses WT branch only
-python -m pipeline.stage4_5_fitness --config config/pipeline_config.yaml
-python -m pipeline.stage5_esmfold --config config/pipeline_config.yaml
-python -m pipeline.stage6_boltz2_screen --config config/pipeline_config.yaml
+# 7-8. Rank + prepare for synthesis
 python -m pipeline.stage7_ranking --config config/pipeline_config.yaml
 python -m pipeline.stage7_5_glycosylation --config config/pipeline_config.yaml
 python -m pipeline.stage8_codon_opt --config config/pipeline_config.yaml
@@ -207,87 +202,40 @@ python -m pipeline.stage8_codon_opt --config config/pipeline_config.yaml
 
 ## Configuration
 
-All parameters are defined in `config/pipeline_config.yaml`. Per-enzyme settings (substrate SMILES, fixed catalytic residues, RFdiffusion3 contigs) go in `config/enzyme_X.yaml`.
+All parameters are in `config/pipeline_config.yaml`. Per-enzyme settings go in `config/enzyme_X.yaml`.
 
 ### Key Parameters
 
-#### Stage 0 — Bottleneck ID
-| Parameter | Default | Reasoning |
-|-----------|---------|-----------|
-| `fcc_threshold` | 0.3 | Enzymes with flux control coefficient > 0.3 are primary design targets; below 0.1 benefit more from expression optimization than protein engineering |
-
-#### Stage 2 — Structure Prediction
-| Parameter | Default | Reasoning |
-|-----------|---------|-----------|
-| `boltz2_seeds` | 5 | 5 independent seeds give sufficient conformational sampling for model selection by confidence score |
-| `recycling_iterations` | 10 | Boltz-2 default; more recycling improves accuracy but with diminishing returns |
-
-#### Stage 3 — RFdiffusion3
-| Parameter | Default | Reasoning |
-|-----------|---------|-----------|
-| `partial_T_conservative` | 10 | Of 50 total timesteps — preserves most of the WT backbone, only remodels loops |
-| `partial_T_standard` | 15 | Moderate diversification around the active site |
-| `partial_T_aggressive` | 20 | Aggressive exploration for high-FCC enzymes where bigger changes are justified |
-| `designs_primary` | 500 | High-FCC enzymes get 500 backbones to maximize diversity |
-| `designs_secondary` | 200 | Low-FCC enzymes get 200 — enough for the library but conserving compute |
-
-#### Stage 4 — LigandMPNN
-| Parameter | Default | Reasoning |
-|-----------|---------|-----------|
-| `temperature_primary` | 0.1 | Low temperature = high confidence, conservative sequences that closely match the backbone |
-| `temperature_exploratory` | 0.2 | Slightly higher diversity to explore more of sequence space |
-| `temperature_wt_high` | 0.4 | Direct WT diversification at higher temperature to generate moderate-risk variants |
-| `number_of_batches` | 16 | Standard sampling depth — 16 independent sequence samples per backbone |
-| `omit_aa` | "C" | Suppress free cysteines to avoid misfolding in yeast cytoplasm (reducing environment) |
-| `pack_side_chains` | true | Enable side-chain packing for more realistic models |
-| `pack_with_ligand_context` | true | Critical: conditions sequence design on the bound substrate geometry |
-
-#### Stage 5 — ESMFold Pre-screen
-| Parameter | Default | Reasoning |
-|-----------|---------|-----------|
-| `plddt_hard_floor` | 60 | Catches only clearly misfolded designs; 70-80 cutoffs reject too many catalytically competent variants (Garcia et al. 2025) |
-| `ca_rmsd_max` | 5.0 A | Eliminates sequences that fold to a completely different topology |
-
-#### Stage 6 — Boltz-2 Screening
-| Parameter | Default | Reasoning |
-|-----------|---------|-----------|
-| `ca_rmsd_max` | 2.0 A | Fold preservation — variants must maintain global structure within 2A of WT |
-| `active_site_rmsd_max` | 1.5 A | Catalytic geometry — tighter threshold because active site positioning is critical for catalysis |
-| `ligand_rmsd_max` | 2.0 A | Substrate must stay in roughly the same position as in the WT complex |
-
-#### Stage 6.5 — MD Simulations (Optional)
-| Parameter | Default | Reasoning |
-|-----------|---------|-----------|
-| `enabled` | false | Optional for Round 1 fast-track; recommended for Round 2+ when compute savings from learned filters offset the cost |
-| `simulation_ns` | 20 | 20 ns is sufficient to observe active site stability and substrate retention without excessive compute |
-| `top_n_candidates` | 200 | 50 per enzyme — balances thoroughness with compute budget |
-
-#### Stage 7 — Ranking
-| Parameter | Default | Reasoning |
-|-----------|---------|-----------|
-| `top_n_candidates` | 200 | 50 per enzyme for Protenix-v1 cross-validation |
-| `protenix_ca_rmsd_agreement` | 2.0 A | Boltz-2 and Protenix-v1 must agree on fold within 2A — designs where two independent predictors disagree are unreliable |
-
-#### Stage 8 — Codon Optimization
-| Parameter | Default | Reasoning |
-|-----------|---------|-----------|
-| `target_gc_min/max` | 0.35-0.45 | Optimal GC range for *S. cerevisiae* expression; avoids mRNA secondary structure issues |
-| `min_cai` | 0.7 | Codon Adaptation Index > 0.7 ensures efficient translation with yeast tRNAs |
+| Stage | Parameter | Default | Reasoning |
+|-------|-----------|---------|-----------|
+| 0 | `enabled` | `false` | Opt-in; when disabled, all enzymes get equal priority |
+| 0 | `method` | `"tfba"` | Thermodynamic FBA more realistic than basic FBA |
+| 3 | `designs_primary` | `2000` | Scaled up for larger funnel with downstream clustering |
+| 3 | `designs_secondary` | `500` | Low-FCC enzymes get fewer but still substantial coverage |
+| 4 | `clustering_identity` | `0.9` | MMseqs2 dedup at 90% identity removes near-duplicates |
+| 4 | `omit_aa` | `"C"` | Suppress free cysteines for yeast cytoplasm |
+| 4.75 | `risk_threshold` | `0.3` | Below this composite = high aggregation risk |
+| 5 | `batch_size` | `8` | True batch ESMFold inference |
+| 5 | `max_to_boltz2` | `5000` | Pre-ranking gate: only top 5K proceed to Stage 6 |
+| 6 | `use_nim` | `false` | Boltz-2 NIM (TRT): 6.8s vs 18s per inference |
+| 6 | `checkpoint_interval` | `200` | Save every 200 seqs for crash recovery |
+| 6.5 | `md_method` | `"gamd"` | GaMD enhanced sampling (recommended over classical) |
+| 6.5 | `gamd_sigma0` | `6.0` | Upper limit of boost potential std dev |
+| 8 | `plate_layout` | `"hedging"` | WT controls + risk-stratified rows |
 
 ### Per-Enzyme Configuration
-
-Each enzyme gets its own YAML file (`config/enzyme_X.yaml`) with:
 
 ```yaml
 name: "Enzyme A"
 length: 428
 sequence_file: "inputs/sequences/enzyme_A.fasta"
-substrate_smiles: "CC(=O)SCoA"          # What it acts on
-product_smiles: "CC(=O)CC(=O)SCoA"      # What it produces
-fixed_residues: [145, 147, 201]          # Catalytic residues — never mutated
-hotspot_residues: [140, 142, 145, 200]   # Active site — focus RFdiffusion3 here
-contigs: "A1-139/0 5-15/A155-428"        # Which regions to redesign
-cofactors: ["NAD+"]                      # Bound cofactors
+substrate_smiles: "CC(=O)SCoA"
+product_smiles: "CC(=O)CC(=O)SCoA"
+ts_smiles: ""                           # Optional: transition state analogue
+fixed_residues: [145, 147, 201]         # Catalytic residues — never mutated
+hotspot_residues: [140, 142, 145, 200]  # Focus RFdiffusion3 here
+contigs: "A1-139/0 5-15/A155-428"
+cofactors: ["NAD+"]
 ```
 
 ---
@@ -297,39 +245,32 @@ cofactors: ["NAD+"]                      # Bound cofactors
 ```
 /data/enzyme_pipeline/
 ├── config/                           # Pipeline + per-enzyme YAML configs
-├── inputs/sequences/                 # Wild-type FASTA files
 ├── stage_01_msa/                     # .a3m MSA files
-├── stage_02_wt_structures/           # Boltz-2 holo PDBs (substrate + product)
-├── stage_03_rfdiffusion3/enzyme_X/   # Diversified backbone PDBs
-├── stage_04_ligandmpnn/              # Designed sequences (FASTA + scores)
+├── stage_02_wt_structures/           # Boltz-2 holo PDBs (substrate+product+TS)
+├── stage_03_rfdiffusion3/            # ~5,000 backbone PDBs
+├── stage_04_ligandmpnn/              # Designed sequences + MMseqs2 clusters
 ├── stage_04.5_fitness_scores/        # Zero-shot fitness CSVs
-├── stage_05_esmfold_prescreen/       # Filtered sequences + pLDDT scores
-├── stage_06_boltz2_screening/        # Full screening results + product inhibition
-├── stage_06.5_md_simulations/        # MD metrics (optional)
-├── stage_07_crossval_ranking/        # Pareto-ranked final candidates
+├── stage_04.75_solubility/           # Solubility scores + risk flags
+├── stage_05_esmfold_prescreen/       # Filtered + pre-ranked sequences
+├── stage_06_boltz2_screening/        # 3-way docking results + checkpoints
+├── stage_06.5_md_simulations/        # GaMD metrics (optional)
+├── stage_07_crossval_ranking/        # Pareto-ranked candidates
 ├── stage_07.5_glycosylation/         # Glycosylation risk annotations
-├── stage_08_codon_opt/               # DNA sequences + 96-well plate maps
-│   ├── dna_sequences/
-│   └── plate_maps/
-├── logs/                             # Structured JSON logs per stage
+├── stage_08_codon_opt/               # DNA sequences + hedging plate maps
+├── logs/                             # Structured JSON logs
 └── results/round_01/                 # Final deliverables
-    ├── final_rankings.csv
-    ├── pareto_front.csv
-    └── synthesis_order.csv
 ```
 
 ---
 
 ## Testing
 
-All modules are tested with mocked external tool calls (no GPU required):
-
 ```bash
-# Run all 451 tests
+# Run all 619 tests (no GPU required — all external tools are mocked)
 python -m pytest tests/ -v
 
 # Run tests for a specific stage
-python -m pytest tests/test_stage3.py -v
+python -m pytest tests/test_stage6.py -v
 ```
 
 ---
@@ -338,21 +279,28 @@ python -m pytest tests/test_stage3.py -v
 
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
-| GPU | 48 GB VRAM | NVIDIA RTX 6000 Pro (96 GB GDDR7) |
+| GPU | 48 GB VRAM | NVIDIA RTX 6000 Pro (96 GB GDDR7, Blackwell) |
 | CPU | 8 cores | 24 cores (Intel i9 / AMD EPYC) |
 | RAM | 64 GB | 128 GB DDR5 |
 | Storage | 1.5 TB | 2+ TB NVMe SSD |
 | OS | Ubuntu 22.04 | Ubuntu 24.04 LTS |
-| CUDA | 12.4 | 13.0 (TensorRT optimized) |
+| CUDA | 12.4 | 13.0 (TensorRT) |
+
+### RTX 6000 Pro Benchmarks (Didi et al. 2025)
+
+| Task | Time | Notes |
+|------|------|-------|
+| MMseqs2-GPU MSA | 10.3s/query | Blackwell DPX kernels, 191x vs JackHMMER |
+| OpenFold-TRT inference | 5.6s/structure | BF16, 2.54x vs vanilla PyTorch |
+| Boltz-2 NIM inference | 6.83s/structure | TRT-compiled, no accuracy loss |
+| 96 GB VRAM handles | up to 949 residues | L40S (48GB) and H100 (80GB) OOM'd on longest targets |
 
 ---
 
 ## DBTL Integration
 
-EnzymeForge is designed for iterative improvement:
-
 - **Round 1**: Generative design (no experimental data) — Pareto ranking maximizes information gain
-- **Round 2+**: Learn scoring weights from Round 1 data using random forest / GP regression; optionally add few-shot active learning (ESM-2 embeddings + GP regression)
+- **Round 2+**: Learn scoring weights from Round 1 data via GP regression; few-shot active learning (ESM-2 embeddings + scikit-learn)
 - **Aspirational**: Closed-loop autonomous enzyme engineering with biofoundry automation
 
 ---
@@ -363,7 +311,7 @@ EnzymeForge is designed for iterative improvement:
 - Watson et al., "RFdiffusion3" (2025) — Baker Lab
 - Dauparas et al., "Robust deep learning-based protein sequence design using ProteinMPNN" (2022)
 - Wohlwend et al., "Boltz-2: Exploring the Limits of Structure Prediction" (2025)
-- Abramson et al., "Accurate structure prediction of biomolecular interactions with AlphaFold 3" (2024)
+- Didi et al., "Highly efficient protein structure prediction" (2025) — NVIDIA, Oxford, Steinegger
 - ByteDance, "Protenix v1" (2026)
 - Notin et al., "ProteinGym: Large-Scale Benchmarks for Protein Fitness Prediction" (NeurIPS 2023)
 - Garcia et al., "pLDDT is an imperfect discriminator of design success" (*Protein Science* 2025)

@@ -122,6 +122,8 @@ METRIC_DIRECTIONS: dict[str, str] = {
     "catpred_kcat": "max",
     "boltz2_substrate_affinity": "max",
     "md_stability_rmsd": "min",
+    "ts_affinity": "max",
+    "ts_substrate_ratio": "max",
 }
 
 # Columns required in the final output
@@ -137,6 +139,8 @@ REQUIRED_OUTPUT_COLUMNS = [
     "catpred_kcat",
     "boltz2_substrate_affinity",
     "md_stability_rmsd",
+    "ts_affinity",
+    "ts_substrate_ratio",
     "protenix_plddt",
     "crossval_ca_rmsd",
     "crossval_passed",
@@ -499,6 +503,17 @@ def collect_all_metrics(
     # 8. MD stability metrics (Stage 6.5, if available) — lower RMSD better
     metrics["md_stability_rmsd"] = _lookup(
         "stage_06_5", "mean_rmsd", float("nan")
+    )
+
+    # 9. Transition state affinity (Stage 6) — tighter TS binding is better
+    metrics["ts_affinity"] = _lookup(
+        "stage_06", "ts_affinity", float("nan")
+    )
+
+    # 10. TS / substrate affinity ratio (Stage 6) — higher means better TS
+    #     stabilization relative to substrate
+    metrics["ts_substrate_ratio"] = _lookup(
+        "stage_06", "ts_substrate_ratio", float("nan")
     )
 
     return metrics

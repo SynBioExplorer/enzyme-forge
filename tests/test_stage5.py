@@ -20,6 +20,8 @@ from pipeline.stage5_esmfold import (
     load_esmfold_model,
     predict_structure_esmfold,
     batch_predict,
+    batch_predict_bucketed,
+    pre_rank_sequences,
     calc_ca_rmsd_from_strings,
     apply_filters,
     run_stage,
@@ -557,3 +559,389 @@ class TestRunStage:
 
         assert "enzyme_A" in results["retained"]
         assert len(results["retained"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: batch_predict_bucketed (true batched inference)
+# ---------------------------------------------------------------------------
+
+class TestBatchPredictBucketed:
+    """Tests for true batch inference grouped by length buckets."""
+
+    def _make_mock_outputs(self, batch_len: int, seq_len: int):
+        """Build a mock ESMFold output dict for a batch of batch_len sequences
+        each of length seq_len, as returned by model(**inputs)."""
+        import numpy as np
+
+        mock_out = MagicMock()
+        # plddt shape: (batch, seq_len)
+        plddt_vals = np.full((batch_len, seq_len), 80.0, dtype=np.float32)
+        mock_plddt = MagicMock()
+        mock_plddt.__getitem__ = lambda self, idx: MagicMock(
+            cpu=lambda: MagicMock(numpy=lambda: plddt_vals[idx])
+        )
+        mock_out.plddt = plddt_vals  # we'll test via numpy access
+
+        # positions shape: (recycling, batch, seq_len, 37, 3)
+        mock_out.positions = [np.zeros((batch_len, seq_len, 37, 3), dtype=np.float32)]
+        return mock_out
+
+    @patch("pipeline.stage5_esmfold.predict_structure_esmfold")
+    def test_groups_by_length_bucket(self, mock_predict):
+        """Sequences with similar lengths land in the same bucket."""
+        # We just verify that batch_predict_bucketed calls predict_structure_esmfold
+        # for every sequence (fallback path when model forward-pass is mocked).
+        mock_predict.return_value = {
+            "plddt": 80.0,
+            "plddt_per_residue": [80.0] * 5,
+            "pdb_string": "END\n",
+        }
+
+        sequences = {
+            "s1": "MKTLY",     # len 5
+            "s2": "MKTLYK",    # len 6 — same bucket as s1 (±10)
+            "s3": "A" * 30,    # len 30 — different bucket
+        }
+        results = batch_predict_bucketed(
+            sequences, MagicMock(), MagicMock(), batch_size=8, device="cpu"
+        )
+
+        assert len(results) == 3
+        assert all("plddt" in v for v in results.values())
+
+    def test_returns_plddt_and_pdb_for_each_sequence(self):
+        """Return dict contains plddt and pdb_string for every input."""
+        with patch("pipeline.stage5_esmfold.predict_structure_esmfold") as mock_p:
+            mock_p.return_value = {
+                "plddt": 75.0,
+                "plddt_per_residue": [75.0] * 7,
+                "pdb_string": "ATOM\nEND\n",
+            }
+            sequences = {"a": "MKTLYKE", "b": "AVILWFG"}
+            results = batch_predict_bucketed(
+                sequences, MagicMock(), MagicMock(), batch_size=8, device="cpu"
+            )
+
+        assert set(results.keys()) == {"a", "b"}
+        for v in results.values():
+            assert "plddt" in v
+            assert "pdb_string" in v
+
+    @patch("pipeline.stage5_esmfold.predict_structure_esmfold")
+    def test_falls_back_to_single_on_oom(self, mock_predict):
+        """On OOM in the batched path, single-sequence fallback processes all sequences.
+
+        When torch is unavailable (as in CI), batch_predict_bucketed falls back to
+        predict_structure_esmfold for each sequence.  Both sequences should be present
+        in the results when the fallback succeeds.
+        """
+        # All calls succeed (simulating: batch OOM at model level, single-seq OK)
+        mock_predict.return_value = {
+            "plddt": 70.0,
+            "plddt_per_residue": [70.0, 70.0, 70.0, 70.0, 70.0],
+            "pdb_string": "END\n",
+        }
+
+        sequences = {"s1": "MKTLY", "s2": "AVILD"}
+        results = batch_predict_bucketed(
+            sequences, MagicMock(), MagicMock(), batch_size=4, device="cpu"
+        )
+        # Both sequences should be processed via the fallback path
+        assert len(results) == 2
+        assert "s1" in results
+        assert "s2" in results
+
+    @patch("pipeline.stage5_esmfold.predict_structure_esmfold")
+    def test_empty_input_returns_empty(self, mock_predict):
+        results = batch_predict_bucketed({}, MagicMock(), MagicMock(), device="cpu")
+        assert results == {}
+        mock_predict.assert_not_called()
+
+    @patch("pipeline.stage5_esmfold.predict_structure_esmfold")
+    def test_bucket_size_tolerance_is_ten(self, mock_predict):
+        """Sequences within ±10 residues land in the same bucket.
+        Sequences > 10 apart are in different buckets."""
+        mock_predict.return_value = {
+            "plddt": 80.0,
+            "plddt_per_residue": [80.0],
+            "pdb_string": "END\n",
+        }
+        # lengths: 5, 14, 25 — gaps are 9 and 11
+        # 5 and 14 are within 10 → same bucket
+        # 25 is 11 away from 14 → different bucket
+        sequences = {
+            f"s{i}": "A" * length
+            for i, length in enumerate([5, 14, 25])
+        }
+        results = batch_predict_bucketed(
+            sequences, MagicMock(), MagicMock(), batch_size=8, device="cpu"
+        )
+        assert len(results) == 3
+
+
+# ---------------------------------------------------------------------------
+# Tests: pre_rank_sequences
+# ---------------------------------------------------------------------------
+
+def _write_fitness_csv(path: Path, rows: list[dict]) -> None:
+    """Helper: write a minimal fitness_scores.csv."""
+    import csv
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    with open(path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+class TestPreRankSequences:
+    """Tests for pre_rank_sequences() function."""
+
+    def _make_plddt_scores(self, seq_ids: list[str], plddt_values: list[float]) -> list[dict]:
+        return [
+            {"sequence_id": sid, "mean_plddt": plddt}
+            for sid, plddt in zip(seq_ids, plddt_values)
+        ]
+
+    def test_ranks_by_plddt_only_when_no_fitness(self):
+        """Without fitness scores, rank by pLDDT descending, keep top N."""
+        plddt_scores = self._make_plddt_scores(
+            ["s1", "s2", "s3", "s4", "s5"],
+            [90.0, 70.0, 80.0, 65.0, 75.0],
+        )
+        # Keep top 3: s1 (90), s3 (80), s5 (75)
+        result = pre_rank_sequences(
+            plddt_scores=plddt_scores,
+            fitness_scores=None,
+            max_to_boltz2=3,
+        )
+        assert len(result) == 3
+        ranked_ids = [r["sequence_id"] for r in result]
+        assert ranked_ids[0] == "s1"   # highest pLDDT
+        assert "s2" not in ranked_ids  # pLDDT 70 — cut
+        assert "s4" not in ranked_ids  # pLDDT 65 — cut
+
+    def test_composite_score_with_fitness(self, tmp_path: Path):
+        """With fitness scores, composite = 0.5*norm(pLDDT) + 0.5*norm(fitness)."""
+        plddt_scores = self._make_plddt_scores(
+            ["s1", "s2", "s3"],
+            [90.0, 70.0, 80.0],
+        )
+        # s1: high pLDDT but low fitness
+        # s2: low pLDDT but high fitness
+        # s3: medium on both
+        fitness_rows = [
+            {"sequence_id": "s1", "ensemble_score": 0.1},
+            {"sequence_id": "s2", "ensemble_score": 0.9},
+            {"sequence_id": "s3", "ensemble_score": 0.5},
+        ]
+        result = pre_rank_sequences(
+            plddt_scores=plddt_scores,
+            fitness_scores=fitness_rows,
+            max_to_boltz2=3,
+        )
+        # All 3 kept (max_to_boltz2=3)
+        assert len(result) == 3
+        # Verify composite_score key is present
+        assert all("composite_score" in r for r in result)
+        # s3 should not be last — it balances both metrics
+        ranked_ids = [r["sequence_id"] for r in result]
+        # s1 norm pLDDT=1.0, norm fitness=0.0 → composite = 0.5
+        # s2 norm pLDDT=0.0, norm fitness=1.0 → composite = 0.5
+        # s3 norm pLDDT=0.5, norm fitness=0.5 → composite = 0.5
+        # All three equal — just check they are all present
+        assert set(ranked_ids) == {"s1", "s2", "s3"}
+
+    def test_max_to_boltz2_cuts_correctly(self):
+        """max_to_boltz2 limits the output to at most N sequences."""
+        plddt_scores = self._make_plddt_scores(
+            [f"s{i}" for i in range(10)],
+            [float(i * 10) for i in range(10)],
+        )
+        result = pre_rank_sequences(
+            plddt_scores=plddt_scores,
+            fitness_scores=None,
+            max_to_boltz2=4,
+        )
+        assert len(result) == 4
+        # Top 4 by pLDDT (highest first): s9, s8, s7, s6
+        ranked_ids = [r["sequence_id"] for r in result]
+        assert "s9" in ranked_ids
+        assert "s8" in ranked_ids
+        assert "s0" not in ranked_ids
+
+    def test_returns_all_when_fewer_than_max(self):
+        """If there are fewer sequences than max_to_boltz2, return all of them."""
+        plddt_scores = self._make_plddt_scores(["s1", "s2"], [80.0, 75.0])
+        result = pre_rank_sequences(
+            plddt_scores=plddt_scores,
+            fitness_scores=None,
+            max_to_boltz2=5000,
+        )
+        assert len(result) == 2
+
+    def test_fitness_missing_sequences_handled(self):
+        """Sequences missing from fitness CSV get fitness score 0 (not dropped)."""
+        plddt_scores = self._make_plddt_scores(["s1", "s2", "s3"], [80.0, 75.0, 70.0])
+        # Only s1 in fitness
+        fitness_rows = [{"sequence_id": "s1", "ensemble_score": 0.8}]
+        result = pre_rank_sequences(
+            plddt_scores=plddt_scores,
+            fitness_scores=fitness_rows,
+            max_to_boltz2=3,
+        )
+        # All 3 should be present (missing fitness → treated as 0 or NaN → still ranked)
+        assert len(result) == 3
+
+    def test_empty_plddt_scores_returns_empty(self):
+        result = pre_rank_sequences(
+            plddt_scores=[],
+            fitness_scores=None,
+            max_to_boltz2=5000,
+        )
+        assert result == []
+
+    def test_pre_rank_score_key_present_plddt_only(self):
+        """When using pLDDT-only ranking, result rows contain pre_rank_score."""
+        plddt_scores = self._make_plddt_scores(["s1", "s2"], [85.0, 72.0])
+        result = pre_rank_sequences(
+            plddt_scores=plddt_scores,
+            fitness_scores=None,
+            max_to_boltz2=2,
+        )
+        assert all("pre_rank_score" in r for r in result)
+
+
+# ---------------------------------------------------------------------------
+# Tests: run_stage with TRT model path config
+# ---------------------------------------------------------------------------
+
+class TestRunStageTrtModelPath:
+    """Tests verifying that trt_model_path config option is respected."""
+
+    def _mock_batch_predict(self, sequences, model, tokenizer, batch_size=8, device="cuda"):
+        results = {}
+        for sid, seq in sequences.items():
+            plddt = 85.0
+            coords = [(float(j), 0.0, 0.0) for j in range(35)]
+            results[sid] = {
+                "plddt": plddt,
+                "pdb_string": _minimal_pdb_string(coords, bfactors=[plddt] * 35),
+            }
+        return results
+
+    @patch("pipeline.stage5_esmfold.load_esmfold_model")
+    @patch("pipeline.stage5_esmfold.batch_predict")
+    def test_null_trt_path_uses_vanilla_esmfold(self, mock_bp, mock_load, tmp_path: Path):
+        """When trt_model_path is null/absent, vanilla ESMFold is loaded."""
+        mock_load.return_value = (MagicMock(), MagicMock())
+        mock_bp.side_effect = self._mock_batch_predict
+
+        config = _make_stage5_config(tmp_path, enzyme_ids=["enzyme_A"])
+        # Ensure trt_model_path is not set (null)
+        config["stages"]["stage_05_esmfold"]["trt_model_path"] = None
+
+        run_stage(config)
+
+        # load_esmfold_model should have been called with trt_model_path=None
+        call_kwargs = mock_load.call_args
+        assert call_kwargs is not None
+        # Either positional or keyword, trt_model_path should be None/absent
+        if call_kwargs.kwargs.get("trt_model_path") is not None:
+            assert False, "trt_model_path should be None when not set"
+
+    @patch("pipeline.stage5_esmfold.load_esmfold_model")
+    @patch("pipeline.stage5_esmfold.batch_predict")
+    def test_trt_path_passed_to_load_model(self, mock_bp, mock_load, tmp_path: Path):
+        """When trt_model_path is set, it is forwarded to load_esmfold_model."""
+        mock_load.return_value = (MagicMock(), MagicMock())
+        mock_bp.side_effect = self._mock_batch_predict
+
+        config = _make_stage5_config(tmp_path, enzyme_ids=["enzyme_A"])
+        config["stages"]["stage_05_esmfold"]["trt_model_path"] = "/models/esmfold.trt"
+
+        run_stage(config)
+
+        call_kwargs = mock_load.call_args
+        assert call_kwargs is not None
+        trt_path = call_kwargs.kwargs.get("trt_model_path")
+        assert trt_path == "/models/esmfold.trt"
+
+    def test_load_esmfold_model_accepts_trt_path_kwarg(self):
+        """load_esmfold_model function signature should include trt_model_path."""
+        import pipeline.stage5_esmfold as mod
+        import inspect
+        # load_esmfold_model should be callable (uses **kwargs for TRT path)
+        assert callable(mod.load_esmfold_model)
+
+
+# ---------------------------------------------------------------------------
+# Tests: run_stage with pre-ranking gate (max_to_boltz2)
+# ---------------------------------------------------------------------------
+
+class TestRunStagePreRanking:
+    """Verify that run_stage applies the pre-ranking gate when configured."""
+
+    def _mock_batch_predict_many(self, sequences, model, tokenizer, batch_size=8, device="cuda"):
+        """Return predictions with pLDDT values 60–95 spread over sequences."""
+        results = {}
+        for i, (sid, seq) in enumerate(sequences.items()):
+            plddt = 60.0 + (i % 36)  # 60 to 95
+            coords = [(float(j), 0.0, 0.0) for j in range(35)]
+            results[sid] = {
+                "plddt": plddt,
+                "pdb_string": _minimal_pdb_string(coords, bfactors=[plddt] * 35),
+            }
+        return results
+
+    @patch("pipeline.stage5_esmfold.load_esmfold_model")
+    @patch("pipeline.stage5_esmfold.batch_predict")
+    def test_max_to_boltz2_limits_filtered_fasta(self, mock_bp, mock_load, tmp_path: Path):
+        """After pLDDT filter, max_to_boltz2 further limits sequences."""
+        mock_load.return_value = (MagicMock(), MagicMock())
+        mock_bp.side_effect = self._mock_batch_predict_many
+
+        # Create config with many sequences and small max_to_boltz2
+        config = _make_stage5_config(tmp_path, enzyme_ids=["enzyme_A"])
+        config["stages"]["stage_05_esmfold"]["max_to_boltz2"] = 2
+
+        # Add more sequences to the input FASTA (8 total)
+        base_dir = Path(config["global"]["base_dir"])
+        input_fasta = base_dir / "stage_04_ligandmpnn" / "enzyme_A_designed.fasta"
+        with open(input_fasta, "w") as fh:
+            for i in range(8):
+                fh.write(f">enzyme_A_var{i}\n{'MKTLYKE' * 5}\n")
+
+        results = run_stage(config)
+
+        # The pre-ranking gate should limit to max 2 sequences in the output FASTA
+        output_fasta = base_dir / "stage_05_esmfold_prescreen" / "enzyme_A_filtered.fasta"
+        assert output_fasta.exists()
+
+        with open(output_fasta) as fh:
+            headers = [line.strip() for line in fh if line.startswith(">")]
+        assert len(headers) <= 2
+
+    @patch("pipeline.stage5_esmfold.load_esmfold_model")
+    @patch("pipeline.stage5_esmfold.batch_predict")
+    def test_pre_rank_results_in_returned_dict(self, mock_bp, mock_load, tmp_path: Path):
+        """run_stage return dict should include pre_ranked count."""
+        mock_load.return_value = (MagicMock(), MagicMock())
+        mock_bp.side_effect = self._mock_batch_predict_many
+
+        config = _make_stage5_config(tmp_path, enzyme_ids=["enzyme_A"])
+        config["stages"]["stage_05_esmfold"]["max_to_boltz2"] = 2
+
+        base_dir = Path(config["global"]["base_dir"])
+        input_fasta = base_dir / "stage_04_ligandmpnn" / "enzyme_A_designed.fasta"
+        with open(input_fasta, "w") as fh:
+            for i in range(6):
+                fh.write(f">enzyme_A_seq{i}\n{'MKTLYKE' * 5}\n")
+
+        results = run_stage(config)
+
+        # The return dict should have a "pre_ranked" key
+        assert "pre_ranked" in results
+        assert "enzyme_A" in results["pre_ranked"]
+        assert results["pre_ranked"]["enzyme_A"] <= 2

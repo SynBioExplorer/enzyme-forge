@@ -1,5 +1,5 @@
 # =============================================================================
-# Enzyme Engineering Pipeline — Global Configuration
+# Enzyme Engineering Pipeline — Global Configuration (v0.3)
 # =============================================================================
 
 global:
@@ -35,7 +35,10 @@ tools:
 stages:
   stage_00_bottleneck:
     output_dir: "stage_00_bottleneck"
+    enabled: false                    # Set true to run FBA bottleneck ID; false = optimize all enzymes equally
+    method: "tfba"                    # "fba" (basic), "tfba" (thermodynamic), "ensemble" (parameter sampling)
     fcc_threshold: 0.3
+    ensemble_iterations: 100          # Number of parameter samples for ensemble method
 
   stage_01_msa:
     output_dir: "stage_01_msa"
@@ -50,8 +53,8 @@ stages:
     partial_T_conservative: 10
     partial_T_standard: 15
     partial_T_aggressive: 20
-    designs_primary: 500
-    designs_secondary: 200
+    designs_primary: 2000             # Scaled up from 500 for larger funnel
+    designs_secondary: 500            # Scaled up from 200
 
   stage_04_ligandmpnn:
     output_dir: "stage_04_ligandmpnn"
@@ -62,26 +65,42 @@ stages:
     omit_aa: "C"
     pack_side_chains: true
     pack_with_ligand_context: true
+    clustering_identity: 0.9          # MMseqs2 clustering after generation (0.9 = 90% identity)
+    clustering_threads: 24            # CPU threads for MMseqs2
 
   stage_04_5_fitness:
     output_dir: "stage_04.5_fitness_scores"
+
+  stage_04_75_solubility:
+    output_dir: "stage_04.75_solubility"
+    enabled: true
+    risk_threshold: 0.3               # Below this composite score = high aggregation risk
 
   stage_05_esmfold:
     output_dir: "stage_05_esmfold_prescreen"
     plddt_hard_floor: 60
     ca_rmsd_max: 5.0
+    batch_size: 8                     # True batch inference for ESMFold
+    max_to_boltz2: 5000               # Pre-ranking gate: pass only top N to Stage 6
+    trt_model_path: null              # Optional TensorRT-compiled ESMFold model path
 
   stage_06_boltz2_screening:
     output_dir: "stage_06_boltz2_screening"
     ca_rmsd_max: 2.0
     active_site_rmsd_max: 1.5
     ligand_rmsd_max: 2.0
+    use_nim: false                    # Boltz-2 NIM (TensorRT-compiled): 6.8s vs 18s per inference
+    checkpoint_interval: 200          # Save results every N sequences for crash recovery
 
   stage_06_5_md:
     output_dir: "stage_06.5_md_simulations"
     enabled: false
+    md_method: "gamd"                 # "gamd" (enhanced sampling, recommended) or "classical"
     simulation_ns: 20
     top_n_candidates: 200
+    gamd_sigma0: 6.0                  # GaMD: upper limit of boost potential std dev
+    gamd_threshold_energy: 0.0        # GaMD: energy threshold (0 = auto-calculate)
+    gamd_equilibration_steps: 50000   # GaMD: equilibration before production
 
   stage_07_crossval:
     output_dir: "stage_07_crossval_ranking"
@@ -96,6 +115,7 @@ stages:
     target_gc_min: 0.35
     target_gc_max: 0.45
     min_cai: 0.7
+    plate_layout: "hedging"           # "hedging" (WT controls + risk tiers) or "sequential"
 
 # ---------------------------------------------------------------------------
 # Enzyme definitions (inline or reference to per-enzyme YAML)
@@ -107,6 +127,7 @@ enzymes:
     sequence_file: "inputs/sequences/enzyme_A.fasta"
     substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
     product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+    ts_smiles: ""                     # Optional: transition state analogue SMILES for TS docking
     fixed_residues: []
     hotspot_residues: []
     contigs: "A1-428"
@@ -118,6 +139,7 @@ enzymes:
     sequence_file: "inputs/sequences/enzyme_B.fasta"
     substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
     product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+    ts_smiles: ""
     fixed_residues: []
     hotspot_residues: []
     contigs: "A1-512"
@@ -129,6 +151,7 @@ enzymes:
     sequence_file: "inputs/sequences/enzyme_C.fasta"
     substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
     product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+    ts_smiles: ""
     fixed_residues: []
     hotspot_residues: []
     contigs: "A1-348"
@@ -140,6 +163,7 @@ enzymes:
     sequence_file: "inputs/sequences/enzyme_D.fasta"
     substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
     product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+    ts_smiles: ""
     fixed_residues: []
     hotspot_residues: []
     contigs: "A1-295"

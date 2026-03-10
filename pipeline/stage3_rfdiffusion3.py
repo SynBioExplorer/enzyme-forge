@@ -5,8 +5,12 @@ preserving the global fold. Uses partial diffusion (partial_T 10-20 of 50
 total timesteps) with an all-atom representation.
 
 Design strategy is guided by flux control coefficients from Stage 0:
-- High-FCC enzymes (FCC > 0.3): 500 backbones at partial_T=15 + 100 at partial_T=20
-- Low-FCC enzymes (FCC <= 0.3): 200 backbones at partial_T=10
+- High-FCC enzymes (FCC > 0.3): 1500 backbones at partial_T=15 + 500 at partial_T=20
+- Low-FCC enzymes (FCC <= 0.3): 500 backbones at partial_T=10
+
+Design counts are configurable via stage config keys:
+  designs_primary_high_fcc, designs_aggressive_high_fcc, designs_primary_low_fcc
+with fallback to designs_primary/designs_secondary if new keys absent.
 
 Pre-filters: radius of gyration, ligand SASA, active site pocket volume.
 

@@ -22,7 +22,12 @@ PIPELINE_DIR = PROJECT_ROOT / "pipeline"
 
 
 def _make_config(tmp_path: Path, extra_stages: dict | None = None) -> dict:
-    """Return a minimal valid pipeline config dict pointing at *tmp_path*."""
+    """Return a minimal valid pipeline config dict pointing at *tmp_path*.
+
+    By default ``enabled=True`` so that tests for the active stage work
+    without modification.  Pass ``extra_stages={"enabled": False}`` to test
+    the disabled path explicitly.
+    """
     base = {
         "global": {
             "project_name": "test",
@@ -42,6 +47,7 @@ def _make_config(tmp_path: Path, extra_stages: dict | None = None) -> dict:
             "stage_00_bottleneck": {
                 "output_dir": "stage_00_bottleneck",
                 "fcc_threshold": 0.3,
+                "enabled": True,  # tests default to enabled; override via extra_stages
                 **(extra_stages or {}),
             },
         },
@@ -443,3 +449,276 @@ class TestLoadYeastGem:
         with mock.patch.object(stage0, "_COBRA_AVAILABLE", False):
             with pytest.raises(ImportError, match="COBRApy"):
                 stage0.load_yeast_gem(tmp_path / "model.xml")
+
+
+# ---------------------------------------------------------------------------
+# Test disabled stage (enabled: false)
+# ---------------------------------------------------------------------------
+
+class TestStageDisabled:
+    def test_disabled_returns_equal_priority(self, stage0, tmp_path):
+        """When enabled=false, all enzymes get FCC=1.0 and priority='equal'."""
+        config = _make_config(tmp_path, extra_stages={"enabled": False})
+        output = stage0.run_stage(config)
+
+        assert output.exists()
+        with open(output) as fh:
+            rows = list(csv.DictReader(fh))
+
+        assert len(rows) == 4
+        for row in rows:
+            assert float(row["fcc"]) == 1.0, f"{row['enzyme_id']} fcc should be 1.0"
+            assert row["priority"] == "equal", f"{row['enzyme_id']} priority should be 'equal'"
+
+    def test_disabled_has_all_enzymes(self, stage0, tmp_path):
+        """Disabled stage CSV must contain all 4 enzymes."""
+        config = _make_config(tmp_path, extra_stages={"enabled": False})
+        output = stage0.run_stage(config)
+
+        with open(output) as fh:
+            rows = list(csv.DictReader(fh))
+
+        assert {r["enzyme_id"] for r in rows} == {
+            "enzyme_A", "enzyme_B", "enzyme_C", "enzyme_D"
+        }
+
+    def test_disabled_does_not_call_cobra(self, stage0, tmp_path):
+        """When disabled, COBRApy/CatPred should not be touched."""
+        config = _make_config(tmp_path, extra_stages={"enabled": False})
+
+        with mock.patch.object(stage0, "load_yeast_gem") as mock_gem, \
+             mock.patch.object(stage0, "run_catpred") as mock_cat:
+            stage0.run_stage(config)
+
+        mock_gem.assert_not_called()
+        mock_cat.assert_not_called()
+
+    def test_disabled_csv_has_correct_columns(self, stage0, tmp_path):
+        """Disabled output CSV must have all standard columns."""
+        config = _make_config(tmp_path, extra_stages={"enabled": False})
+        output = stage0.run_stage(config)
+
+        with open(output) as fh:
+            rows = list(csv.DictReader(fh))
+
+        expected_cols = {"enzyme_id", "fcc", "kcat_pred", "km_pred", "priority", "notes"}
+        assert set(rows[0].keys()) == expected_cols
+
+    def test_enabled_true_runs_normally(self, stage0, tmp_path):
+        """When enabled=true, stage runs the full analysis."""
+        config = _make_config(tmp_path, extra_stages={"enabled": True})
+
+        with mock.patch.object(stage0, "_COBRA_AVAILABLE", False):
+            output = stage0.run_stage(config)
+
+        with open(output) as fh:
+            rows = list(csv.DictReader(fh))
+
+        # In normal mode priority is primary/secondary, not equal
+        priorities = {r["priority"] for r in rows}
+        assert priorities <= {"primary", "secondary"}
+
+
+# ---------------------------------------------------------------------------
+# Test TFBA method
+# ---------------------------------------------------------------------------
+
+class TestTFBAMethod:
+    def test_run_tfba_function_exists(self, stage0):
+        """run_tfba() function must be defined."""
+        assert hasattr(stage0, "run_tfba"), "run_tfba function not found"
+        assert callable(stage0.run_tfba)
+
+    def test_method_tfba_uses_run_tfba(self, stage0, tmp_path):
+        """When method='tfba', run_stage calls run_tfba for FCC computation."""
+        config = _make_config(tmp_path, extra_stages={"method": "tfba"})
+
+        fake_fcc = {
+            "enzyme_A": 0.55,
+            "enzyme_B": 0.40,
+            "enzyme_C": 0.20,
+            "enzyme_D": 0.10,
+        }
+
+        with mock.patch.object(stage0, "run_tfba", return_value=fake_fcc) as mock_tfba, \
+             mock.patch.object(stage0, "_COBRA_AVAILABLE", True), \
+             mock.patch.object(stage0, "load_yeast_gem"):
+            output = stage0.run_stage(config)
+
+        mock_tfba.assert_called_once()
+        assert output.exists()
+        with open(output) as fh:
+            rows = list(csv.DictReader(fh))
+        fcc_map = {r["enzyme_id"]: float(r["fcc"]) for r in rows}
+        assert abs(fcc_map["enzyme_A"] - 0.55) < 1e-3
+
+    def test_method_fba_uses_calculate_fcc(self, stage0, tmp_path):
+        """When method='fba' (explicit), run_stage uses the standard calculate_fcc path."""
+        config = _make_config(tmp_path, extra_stages={"method": "fba"})
+
+        with mock.patch.object(stage0, "_COBRA_AVAILABLE", False):
+            output = stage0.run_stage(config)
+
+        assert output.exists()
+        with open(output) as fh:
+            rows = list(csv.DictReader(fh))
+        assert len(rows) == 4
+
+    def test_run_tfba_returns_dict(self, stage0):
+        """run_tfba() must return a dict mapping enzyme_id to float FCC."""
+        mock_model = mock.MagicMock()
+        reaction_map = {
+            "enzyme_A": "rxn_enzyme_A",
+            "enzyme_B": "rxn_enzyme_B",
+            "enzyme_C": "rxn_enzyme_C",
+            "enzyme_D": "rxn_enzyme_D",
+        }
+        enzyme_ids = list(reaction_map.keys())
+
+        with mock.patch.object(stage0, "_EQUILIBRATOR_AVAILABLE", False, create=True):
+            result = stage0.run_tfba(mock_model, enzyme_ids, reaction_map)
+
+        assert isinstance(result, dict)
+        assert set(result.keys()) == set(enzyme_ids)
+        for v in result.values():
+            assert isinstance(v, float)
+
+    def test_tfba_falls_back_when_equilibrator_missing(self, stage0, tmp_path):
+        """When equilibrator_api is unavailable, tfba falls back to standard FBA FCCs."""
+        config = _make_config(tmp_path, extra_stages={"method": "tfba"})
+
+        # Ensure equilibrator is flagged unavailable
+        with mock.patch.object(stage0, "_COBRA_AVAILABLE", True), \
+             mock.patch.object(stage0, "load_yeast_gem"), \
+             mock.patch.object(stage0, "_EQUILIBRATOR_AVAILABLE", False, create=True), \
+             mock.patch.object(stage0, "calculate_fcc", return_value=0.25) as mock_fcc:
+            output = stage0.run_stage(config)
+
+        assert output.exists()
+
+
+# ---------------------------------------------------------------------------
+# Test ensemble method
+# ---------------------------------------------------------------------------
+
+class TestEnsembleMethod:
+    def test_run_ensemble_function_exists(self, stage0):
+        """run_ensemble() function must be defined."""
+        assert hasattr(stage0, "run_ensemble"), "run_ensemble function not found"
+        assert callable(stage0.run_ensemble)
+
+    def test_method_ensemble_produces_output(self, stage0, tmp_path):
+        """When method='ensemble', run_stage produces a valid CSV."""
+        config = _make_config(
+            tmp_path, extra_stages={"method": "ensemble", "ensemble_n": 10}
+        )
+
+        fake_ensemble_result = {
+            "enzyme_A": {"fcc_median": 0.55, "fcc_ci_low": 0.40, "fcc_ci_high": 0.70},
+            "enzyme_B": {"fcc_median": 0.35, "fcc_ci_low": 0.20, "fcc_ci_high": 0.50},
+            "enzyme_C": {"fcc_median": 0.20, "fcc_ci_low": 0.10, "fcc_ci_high": 0.30},
+            "enzyme_D": {"fcc_median": 0.10, "fcc_ci_low": 0.05, "fcc_ci_high": 0.15},
+        }
+
+        with mock.patch.object(stage0, "run_ensemble", return_value=fake_ensemble_result) as mock_ens, \
+             mock.patch.object(stage0, "_COBRA_AVAILABLE", True), \
+             mock.patch.object(stage0, "load_yeast_gem"):
+            output = stage0.run_stage(config)
+
+        mock_ens.assert_called_once()
+        assert output.exists()
+
+    def test_ensemble_csv_has_ci_columns(self, stage0, tmp_path):
+        """Ensemble output CSV must include fcc_ci_low and fcc_ci_high columns."""
+        config = _make_config(
+            tmp_path, extra_stages={"method": "ensemble", "ensemble_n": 10}
+        )
+
+        fake_ensemble_result = {
+            "enzyme_A": {"fcc_median": 0.55, "fcc_ci_low": 0.40, "fcc_ci_high": 0.70},
+            "enzyme_B": {"fcc_median": 0.35, "fcc_ci_low": 0.20, "fcc_ci_high": 0.50},
+            "enzyme_C": {"fcc_median": 0.20, "fcc_ci_low": 0.10, "fcc_ci_high": 0.30},
+            "enzyme_D": {"fcc_median": 0.10, "fcc_ci_low": 0.05, "fcc_ci_high": 0.15},
+        }
+
+        with mock.patch.object(stage0, "run_ensemble", return_value=fake_ensemble_result), \
+             mock.patch.object(stage0, "_COBRA_AVAILABLE", True), \
+             mock.patch.object(stage0, "load_yeast_gem"):
+            output = stage0.run_stage(config)
+
+        with open(output) as fh:
+            rows = list(csv.DictReader(fh))
+
+        assert "fcc_ci_low" in rows[0], "Missing fcc_ci_low column in ensemble output"
+        assert "fcc_ci_high" in rows[0], "Missing fcc_ci_high column in ensemble output"
+
+    def test_ensemble_uses_median_for_fcc(self, stage0, tmp_path):
+        """Ensemble mode uses fcc_median as the fcc value for ranking."""
+        config = _make_config(
+            tmp_path, extra_stages={"method": "ensemble", "ensemble_n": 5}
+        )
+
+        fake_ensemble_result = {
+            "enzyme_A": {"fcc_median": 0.55, "fcc_ci_low": 0.40, "fcc_ci_high": 0.70},
+            "enzyme_B": {"fcc_median": 0.35, "fcc_ci_low": 0.20, "fcc_ci_high": 0.50},
+            "enzyme_C": {"fcc_median": 0.20, "fcc_ci_low": 0.10, "fcc_ci_high": 0.30},
+            "enzyme_D": {"fcc_median": 0.10, "fcc_ci_low": 0.05, "fcc_ci_high": 0.15},
+        }
+
+        with mock.patch.object(stage0, "run_ensemble", return_value=fake_ensemble_result), \
+             mock.patch.object(stage0, "_COBRA_AVAILABLE", True), \
+             mock.patch.object(stage0, "load_yeast_gem"):
+            output = stage0.run_stage(config)
+
+        with open(output) as fh:
+            rows = list(csv.DictReader(fh))
+
+        fcc_map = {r["enzyme_id"]: float(r["fcc"]) for r in rows}
+        assert abs(fcc_map["enzyme_A"] - 0.55) < 1e-3
+
+    def test_run_ensemble_returns_dict_structure(self, stage0):
+        """run_ensemble() must return dict with fcc_median, fcc_ci_low, fcc_ci_high."""
+        mock_model = mock.MagicMock()
+        reaction_map = {
+            "enzyme_A": "rxn_enzyme_A",
+            "enzyme_B": "rxn_enzyme_B",
+        }
+        enzyme_ids = list(reaction_map.keys())
+        kinetics = {
+            "enzyme_A": {"kcat": 12.5, "km": 0.45},
+            "enzyme_B": {"kcat": 8.3, "km": 0.82},
+        }
+
+        with mock.patch.object(stage0, "calculate_fcc", return_value=0.5):
+            result = stage0.run_ensemble(
+                mock_model, enzyme_ids, reaction_map, kinetics, n_iterations=5
+            )
+
+        assert isinstance(result, dict)
+        for eid in enzyme_ids:
+            assert eid in result
+            assert "fcc_median" in result[eid]
+            assert "fcc_ci_low" in result[eid]
+            assert "fcc_ci_high" in result[eid]
+            assert isinstance(result[eid]["fcc_median"], float)
+
+    def test_run_ensemble_respects_n_iterations(self, stage0):
+        """run_ensemble() samples kinetic parameters n_iterations times."""
+        mock_model = mock.MagicMock()
+        reaction_map = {"enzyme_A": "rxn_enzyme_A"}
+        enzyme_ids = ["enzyme_A"]
+        kinetics = {"enzyme_A": {"kcat": 12.5, "km": 0.45}}
+
+        fcc_call_counts = []
+        def counting_fcc(*args, **kwargs):
+            fcc_call_counts.append(1)
+            return 0.4
+
+        with mock.patch.object(stage0, "calculate_fcc", side_effect=counting_fcc):
+            stage0.run_ensemble(
+                mock_model, enzyme_ids, reaction_map, kinetics, n_iterations=7
+            )
+
+        assert len(fcc_call_counts) == 7, (
+            f"Expected 7 FCC calls (one per iteration), got {len(fcc_call_counts)}"
+        )

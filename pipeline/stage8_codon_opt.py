@@ -16,11 +16,14 @@ CLI: python pipeline/stage8_codon_opt.py --config config.yaml
 from __future__ import annotations
 
 import argparse
+import bisect
 import logging
 import math
+import os
 import random
 import re
 import string
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -643,6 +646,24 @@ def _has_restriction_sites(dna_seq: str) -> bool:
     return False
 
 
+def count_mutations_from_wt(sequence: str, wt_sequence: str) -> int:
+    """Count number of amino acid differences from wild-type.
+
+    Comparison is case-insensitive. Only positions present in both sequences
+    (up to the shorter length) are compared.
+
+    Args:
+        sequence: Variant amino acid sequence.
+        wt_sequence: Wild-type amino acid sequence.
+
+    Returns:
+        Integer count of positions that differ.
+    """
+    seq = sequence.upper()
+    wt = wt_sequence.upper()
+    return sum(a != b for a, b in zip(seq, wt))
+
+
 def add_flanking_sequences(
     dna_seq: str,
     enzyme_id: str,
@@ -671,6 +692,9 @@ def generate_plate_map(
     sequences: dict[str, str],
     enzyme_id: str,
     plate_size: int = 96,
+    layout_strategy: str = "hedging",
+    variant_info: dict[str, tuple[str, int, int]] | None = None,
+    wt_sequence: str | None = None,
 ) -> list[dict[str, Any]]:
     """Assign sequences to 96-well plate positions (A1-H12).
 
@@ -678,10 +702,50 @@ def generate_plate_map(
         sequences: Dict of {sequence_id: dna_sequence}.
         enzyme_id: Enzyme identifier.
         plate_size: Number of wells per plate (default 96).
+        layout_strategy: "hedging" (default) or "sequential".
+
+            "sequential" — fills wells A1 → A12 → B1 → … → H12 in input order
+            (original behaviour, backward compatible).
+
+            "hedging" — expression-hedging layout:
+                - Well A1:  WT control (sequence with lowest mutation_count,
+                            or the sequence_id equal to "wt" if present).
+                - Well H12: WT control (second WT slot, filled by the same
+                            or another WT replica if enough sequences).
+                - Rows A-B (excl. A1): conservative variants (bottom 25%
+                            by mutation count).
+                - Rows C-F: moderate variants (middle 50% by mutation count).
+                - Rows G-H (excl. H12): aggressive variants (top 25% by
+                            mutation count).
+                - Within each tier: sorted by Pareto rank ascending
+                  (best rank first).
+                Requires ``variant_info`` and ``wt_sequence`` arguments.
+
+        variant_info: Required for hedging layout.
+            Dict of {sequence_id: (protein_seq, mutation_count, pareto_rank)}.
+        wt_sequence: Wild-type protein sequence string.  Used to identify the
+            WT control well.  The sequence whose ``mutation_count`` is 0 is
+            treated as the WT control.
 
     Returns:
-        List of dicts with well assignments.
+        List of dicts with well assignments.  Hedging layout adds
+        ``mutation_count``, ``risk_tier``, and ``pareto_rank`` columns.
     """
+    if layout_strategy == "sequential":
+        return _generate_plate_map_sequential(sequences, enzyme_id, plate_size)
+
+    # Default: hedging layout
+    return _generate_plate_map_hedging(
+        sequences, enzyme_id, plate_size, variant_info or {}, wt_sequence or ""
+    )
+
+
+def _generate_plate_map_sequential(
+    sequences: dict[str, str],
+    enzyme_id: str,
+    plate_size: int,
+) -> list[dict[str, Any]]:
+    """Sequential well assignment (original behaviour)."""
     plate_map: list[dict[str, Any]] = []
     seq_list = list(sequences.items())
     wells_per_plate = min(plate_size, len(PLATE_ROWS) * len(PLATE_COLS))
@@ -703,6 +767,260 @@ def generate_plate_map(
         })
 
     return plate_map
+
+
+# Wells belonging to each hedging region on a standard 96-well plate
+# (plate 1 only; subsequent plates use sequential layout for overflow).
+_HEDGING_WT_A1   = "A1"
+_HEDGING_WT_H12  = "H12"
+_HEDGING_ROW_CONSERVATIVE = ("A", "B")   # rows A-B (A1 reserved for WT)
+_HEDGING_ROWS_MODERATE    = ("C", "D", "E", "F")
+_HEDGING_ROWS_AGGRESSIVE  = ("G", "H")   # H12 reserved for WT
+
+
+def _hedging_wells(rows: tuple[str, ...], exclude: set[str] | None = None) -> list[str]:
+    """Generate well names for the given rows, optionally excluding specific wells."""
+    if exclude is None:
+        exclude = set()
+    wells: list[str] = []
+    for row in rows:
+        for col in PLATE_COLS:
+            w = f"{row}{col}"
+            if w not in exclude:
+                wells.append(w)
+    return wells
+
+
+def _assign_risk_tier(mutation_count: int, sorted_counts: list[int]) -> str:
+    """Assign a risk tier based on where mutation_count falls in sorted_counts.
+
+    Uses the left-insertion index (bisect_left) so that a value not present in
+    the list is placed correctly and values at the boundaries are consistent.
+
+    Bottom 25%  -> "conservative"
+    Middle 50%  -> "moderate"
+    Top 25%     -> "aggressive"
+    """
+    n = len(sorted_counts)
+    if n == 0:
+        return "moderate"
+    # Use bisect_left so the rank equals the number of elements strictly less
+    # than mutation_count, giving a consistent percentile for any value.
+    rank = bisect.bisect_left(sorted_counts, mutation_count)
+    pct = rank / n  # 0.0 .. <1.0
+    if pct < 0.25:
+        return "conservative"
+    elif pct < 0.75:
+        return "moderate"
+    else:
+        return "aggressive"
+
+
+def _generate_plate_map_hedging(
+    sequences: dict[str, str],
+    enzyme_id: str,
+    plate_size: int,
+    variant_info: dict[str, tuple[str, int, int]],
+    wt_sequence: str,
+) -> list[dict[str, Any]]:
+    """Expression-hedging well assignment.
+
+    Layout (plate 1):
+      A1   — WT control (sequence with mutation_count == 0, or least-mutated
+              if no exact WT is supplied)
+      H12  — WT control (second WT replica, or same WT if only one exists)
+      A2-B12  — conservative variants (sorted by Pareto rank)
+      C1-F12  — moderate variants   (sorted by Pareto rank)
+      G1-H11  — aggressive variants (sorted by Pareto rank)
+
+    Risk tiers are computed over ALL non-WT sequences:
+      Bottom 25%  -> conservative
+      Middle 50%  -> moderate
+      Top 25%     -> aggressive
+
+    Any sequences that overflow the reserved row slots spill into remaining
+    wells on plate 1.  Sequences beyond plate 1 capacity go to plate 2+
+    using sequential layout.
+    """
+    wells_per_plate = min(plate_size, len(PLATE_ROWS) * len(PLATE_COLS))
+
+    # Identify WT candidates (mutation_count == 0).
+    wt_candidates: list[str] = []
+    non_wt_ids:    list[str] = []
+
+    for seq_id in sequences:
+        info = variant_info.get(seq_id)
+        mut_count = info[1] if info is not None else 0
+        if mut_count == 0:
+            wt_candidates.append(seq_id)
+        else:
+            non_wt_ids.append(seq_id)
+
+    # If no explicit WT found, pick the sequence with the lowest mutation
+    # count (alphabetically first on ties) as WT control.
+    if not wt_candidates:
+        all_ids = list(sequences.keys())
+        wt_candidates = [
+            min(all_ids, key=lambda sid: (variant_info.get(sid, ("", 9999, 9999))[1], sid))
+        ]
+        # WT control is NOT removed from the variant pool for tier computation;
+        # it is simply duplicated in A1 and H12.  The pool for tier assignment
+        # is the full set of non-WT-candidate sequences.
+        non_wt_ids = [s for s in sequences if s not in wt_candidates]
+
+    # Assign WT controls: A1 and H12.
+    wt_a1 = wt_candidates[0]
+    wt_h12 = wt_candidates[1] if len(wt_candidates) > 1 else wt_a1
+
+    # Compute mutation counts and tiers over the full non-WT pool.
+    # (The WT control wells are fixed; only non-WT sequences get tiered.)
+    mut_counts_sorted = sorted(
+        variant_info[sid][1] for sid in non_wt_ids if sid in variant_info
+    )
+
+    def _tier(seq_id: str) -> str:
+        info = variant_info.get(seq_id)
+        if info is None:
+            return "moderate"
+        return _assign_risk_tier(info[1], mut_counts_sorted)
+
+    def _pareto(seq_id: str) -> int:
+        info = variant_info.get(seq_id)
+        return info[2] if info is not None else 9999
+
+    def _mut_count(seq_id: str) -> int:
+        info = variant_info.get(seq_id)
+        return info[1] if info is not None else 0
+
+    # Group and sort non-WT sequences by tier then Pareto rank.
+    conservative = sorted(
+        [s for s in non_wt_ids if _tier(s) == "conservative"],
+        key=_pareto,
+    )
+    moderate = sorted(
+        [s for s in non_wt_ids if _tier(s) == "moderate"],
+        key=_pareto,
+    )
+    aggressive = sorted(
+        [s for s in non_wt_ids if _tier(s) == "aggressive"],
+        key=_pareto,
+    )
+
+    # Build available well slots for each zone on plate 1.
+    cons_wells  = _hedging_wells(_HEDGING_ROW_CONSERVATIVE, exclude={_HEDGING_WT_A1})
+    mod_wells   = _hedging_wells(_HEDGING_ROWS_MODERATE)
+    agg_wells   = _hedging_wells(_HEDGING_ROWS_AGGRESSIVE,  exclude={_HEDGING_WT_H12})
+    overflow_wells: list[str] = []  # collect remaining wells for spill
+
+    def _base_row(seq_id: str, tier: str = "moderate") -> dict[str, Any]:
+        dna_seq = sequences[seq_id]
+        return {
+            "enzyme_id": enzyme_id,
+            "sequence_id": seq_id,
+            "protein_length_aa": len(dna_seq) // 3,
+            "dna_length_nt": len(dna_seq),
+            "plate_number": 1,
+            "mutation_count": _mut_count(seq_id),
+            "risk_tier": tier,
+            "pareto_rank": _pareto(seq_id),
+        }
+
+    plate_map: list[dict[str, Any]] = []
+
+    # Place WT controls.
+    def _place_wt(seq_id: str, well: str, tier: str) -> None:
+        row = _base_row(seq_id, tier=tier)
+        row["well_position"] = well
+        plate_map.append(row)
+
+    _place_wt(wt_a1,  _HEDGING_WT_A1,  "conservative")
+    _place_wt(wt_h12, _HEDGING_WT_H12, "aggressive")
+
+    # Fill tier zones; overflow into a flat list.
+    def _fill_zone(
+        zone_seqs: list[str],
+        zone_wells: list[str],
+        tier: str,
+        overflow: list[str],
+    ) -> None:
+        for i, seq_id in enumerate(zone_seqs):
+            if i < len(zone_wells):
+                row = _base_row(seq_id, tier=tier)
+                row["well_position"] = zone_wells[i]
+                plate_map.append(row)
+            else:
+                overflow.append(seq_id)
+
+    _fill_zone(conservative, cons_wells,  "conservative", overflow_wells)
+    _fill_zone(moderate,     mod_wells,   "moderate",     overflow_wells)
+    _fill_zone(aggressive,   agg_wells,   "aggressive",   overflow_wells)
+
+    # Assign overflow sequences to remaining wells on plate 1, then plate 2+.
+    assigned_wells: set[str] = set()
+    for r in plate_map:
+        if r["plate_number"] == 1:
+            assigned_wells.add(r["well_position"])
+
+    remaining_p1: list[str] = []
+    for row_lbl in PLATE_ROWS:
+        for col in PLATE_COLS:
+            w = f"{row_lbl}{col}"
+            if w not in assigned_wells:
+                remaining_p1.append(w)
+
+    for i, seq_id in enumerate(overflow_wells):
+        tier_for_overflow = _tier(seq_id)
+        if i < len(remaining_p1):
+            row = _base_row(seq_id, tier=tier_for_overflow)
+            row["well_position"] = remaining_p1[i]
+            plate_map.append(row)
+        else:
+            # Overflow to subsequent plates (sequential).
+            plate_num = (i - len(remaining_p1)) // wells_per_plate + 2
+            well_idx  = (i - len(remaining_p1)) % wells_per_plate
+            row_lbl   = PLATE_ROWS[well_idx // len(PLATE_COLS)]
+            col_num   = PLATE_COLS[well_idx % len(PLATE_COLS)]
+            row = _base_row(seq_id, tier=tier_for_overflow)
+            row["well_position"] = f"{row_lbl}{col_num}"
+            row["plate_number"]  = plate_num
+            plate_map.append(row)
+
+    # Sort output for readability: plate -> well row then col.
+    def _sort_key(r: dict[str, Any]) -> tuple[int, str, int]:
+        well = r["well_position"]
+        return (r["plate_number"], well[0], int(well[1:]))
+
+    plate_map.sort(key=_sort_key)
+    return plate_map
+
+
+def _optimize_single_sequence(
+    seq_id: str,
+    protein_seq: str,
+    max_iterations: int,
+    target_gc_min: float,
+    target_gc_max: float,
+    min_cai: float,
+    seed: int | None,
+    enzyme_id: str,
+    cloning_config: dict[str, str],
+) -> tuple[str, str, dict[str, Any], int]:
+    """Worker for parallel codon optimization (ProcessPoolExecutor).
+
+    Returns:
+        (seq_id, dna_construct, optimization_metrics, protein_length)
+    """
+    clean_protein = protein_seq.upper().replace("*", "").replace(" ", "")
+    optimized_dna, metrics = optimize_sequence(
+        clean_protein,
+        max_iterations=max_iterations,
+        target_gc_min=target_gc_min,
+        target_gc_max=target_gc_max,
+        target_cai_min=min_cai,
+        seed=seed,
+    )
+    construct = add_flanking_sequences(optimized_dna, enzyme_id, cloning_config)
+    return seq_id, construct, metrics, len(clean_protein)
 
 
 # ---------------------------------------------------------------------------
@@ -788,44 +1106,56 @@ def run_stage(config: dict[str, Any]) -> dict[str, Any]:
 
         logger.info("%s: %d input sequences from %s", enzyme_id, len(protein_seqs), input_fasta)
 
-        # Optimize each sequence
+        # Optimize each sequence (parallel when enough sequences)
         dna_sequences: dict[str, str] = {}
         plate_rows: list[dict[str, Any]] = []
         cai_values: list[float] = []
         gc_values: list[float] = []
 
-        for seq_id, protein_seq in protein_seqs.items():
-            # Clean protein sequence
-            clean_protein = protein_seq.upper().replace("*", "").replace(" ", "")
-
-            optimized_dna, metrics = optimize_sequence(
-                clean_protein,
-                max_iterations=max_iterations,
-                target_gc_min=target_gc_min,
-                target_gc_max=target_gc_max,
-                target_cai_min=min_cai,
-                seed=seed,
-            )
-
-            # Add flanking sequences
-            construct = add_flanking_sequences(
-                optimized_dna, enzyme_id, cloning_config
-            )
-
-            dna_sequences[seq_id] = construct
+        def _collect_result(
+            sid: str, construct: str, metrics: dict[str, Any], protein_len: int
+        ) -> None:
+            dna_sequences[sid] = construct
             cai_values.append(metrics["cai"])
             gc_values.append(metrics["gc_content"])
-
             plate_rows.append({
                 "enzyme_id": enzyme_id,
-                "sequence_id": seq_id,
-                "protein_length_aa": len(clean_protein),
+                "sequence_id": sid,
+                "protein_length_aa": protein_len,
                 "dna_length_nt": len(construct),
                 "cai": metrics["cai"],
                 "gc_content": metrics["gc_content"],
                 "has_restriction_sites": metrics.get("has_restriction_sites", False),
                 "status": "optimized",
             })
+
+        n_workers = min(os.cpu_count() or 1, len(protein_seqs))
+        if n_workers > 1 and len(protein_seqs) >= 4:
+            logger.info(
+                "%s: optimizing %d sequences in parallel (%d workers)",
+                enzyme_id, len(protein_seqs), n_workers,
+            )
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _optimize_single_sequence,
+                        seq_id, protein_seq,
+                        max_iterations, target_gc_min, target_gc_max,
+                        min_cai, seed, enzyme_id, cloning_config,
+                    )
+                    for seq_id, protein_seq in protein_seqs.items()
+                ]
+                for future in futures:
+                    sid, construct, metrics, protein_len = future.result()
+                    _collect_result(sid, construct, metrics, protein_len)
+        else:
+            for seq_id, protein_seq in protein_seqs.items():
+                sid, construct, metrics, protein_len = _optimize_single_sequence(
+                    seq_id, protein_seq,
+                    max_iterations, target_gc_min, target_gc_max,
+                    min_cai, seed, enzyme_id, cloning_config,
+                )
+                _collect_result(sid, construct, metrics, protein_len)
 
         # Generate plate maps
         plate_map = generate_plate_map(dna_sequences, enzyme_id)

@@ -3,17 +3,25 @@
 Implements protocols from contracts/utils_protocol.py:
 FASTA I/O, PDB I/O, scores CSV I/O, structured logging,
 VRAM monitoring, and MD5 checksum helpers.
+
+Hardware optimisation utilities (bf16_autocast, IncrementalCheckpoint,
+compress_file, decompress_file, compress_directory, count_mutations,
+group_by_length) are appended at the end of this module.
 """
 
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import json
 import logging
+import shutil
 import subprocess
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Generator
 
 import numpy as np
 import pandas as pd
@@ -373,3 +381,229 @@ def md5_checksum(file_path: Path) -> str:
         for chunk in iter(lambda: fh.read(8192), b""):
             md5.update(chunk)
     return md5.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Hardware optimisation utilities
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def bf16_autocast(device: str = "cuda") -> Generator[None, None, None]:
+    """Context manager for BF16 mixed precision inference on Blackwell GPUs.
+
+    Falls back to a no-op context when PyTorch is not installed so that the
+    rest of the pipeline can still import and run on CPU-only machines.
+
+    Args:
+        device: PyTorch device string, e.g. ``'cuda'`` or ``'cpu'``.
+
+    Example::
+
+        with bf16_autocast():
+            logits = model(inputs)
+    """
+    try:
+        import torch  # noqa: PLC0415
+
+        with torch.amp.autocast(device, dtype=torch.bfloat16):
+            yield
+    except ImportError:
+        yield  # No-op if torch not available
+
+
+class IncrementalCheckpoint:
+    """Save results incrementally to allow crash recovery.
+
+    Results are persisted to a CSV file every *interval* additions so that a
+    pipeline stage can resume from the last checkpoint rather than restarting
+    from scratch.
+
+    Args:
+        checkpoint_path: Path to the CSV file used for persistent storage.
+        interval: Number of ``add_result`` calls between automatic saves.
+
+    Example::
+
+        ckpt = IncrementalCheckpoint(Path("run/ckpt.csv"), interval=100)
+        completed = ckpt.get_completed_ids()
+        for seq_id, seq in sequences.items():
+            if seq_id in completed:
+                continue
+            result = run_inference(seq_id, seq)
+            ckpt.add_result(result)
+    """
+
+    def __init__(self, checkpoint_path: Path, interval: int = 200) -> None:
+        self.path = Path(checkpoint_path)
+        self.interval = interval
+        self.results: list[dict] = []
+        self._unsaved_count: int = 0
+        self._load_existing()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load_existing(self) -> None:
+        """Load previously checkpointed results on resume."""
+        if self.path.exists():
+            try:
+                existing = read_scores(self.path)
+                self.results = existing
+            except Exception:
+                # Corrupted checkpoint – start fresh but keep the file for
+                # manual inspection.
+                warnings.warn(
+                    f"Could not read checkpoint {self.path}. Starting fresh.",
+                    stacklevel=2,
+                )
+                self.results = []
+        else:
+            self.results = []
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_completed_ids(self) -> set:
+        """Return set of already-completed sequence_ids."""
+        return {r["sequence_id"] for r in self.results if "sequence_id" in r}
+
+    def add_result(self, result: dict) -> None:
+        """Add a result and auto-save if *interval* results have accumulated.
+
+        Args:
+            result: Dictionary containing at minimum a ``sequence_id`` key.
+        """
+        self.results.append(result)
+        self._unsaved_count += 1
+        if self._unsaved_count >= self.interval:
+            self.save()
+            self._unsaved_count = 0
+
+    def save(self) -> None:
+        """Force save current results to CSV."""
+        if not self.results:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        write_scores(self.results, self.path)
+
+
+# ---------------------------------------------------------------------------
+# File compression helpers
+# ---------------------------------------------------------------------------
+
+def compress_file(path: Path) -> Path:
+    """Gzip compress a file, returning the ``.gz`` path, then delete original.
+
+    Args:
+        path: Path to the file to compress.
+
+    Returns:
+        Path to the newly created ``.gz`` file.
+    """
+    path = Path(path)
+    gz_path = path.with_suffix(path.suffix + ".gz")
+    with open(path, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    path.unlink()
+    return gz_path
+
+
+def decompress_file(gz_path: Path) -> Path:
+    """Decompress a ``.gz`` file, returning the path to the decompressed file.
+
+    The ``.gz`` extension is stripped to derive the output path.
+
+    Args:
+        gz_path: Path to the ``.gz`` file.
+
+    Returns:
+        Path to the decompressed file.
+    """
+    gz_path = Path(gz_path)
+    if gz_path.suffix != ".gz":
+        raise ValueError(f"Expected a .gz file, got: {gz_path}")
+    out_path = gz_path.with_suffix("")
+    with gzip.open(gz_path, "rb") as f_in, open(out_path, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    return out_path
+
+
+def compress_directory(dir_path: Path, pattern: str = "*.pdb") -> None:
+    """Gzip compress all files matching *pattern* inside *dir_path*.
+
+    Each matched file is compressed in-place (original deleted, ``.gz`` kept).
+
+    Args:
+        dir_path: Directory to search (non-recursive).
+        pattern: Glob pattern, e.g. ``"*.pdb"`` or ``"*.fasta"``.
+    """
+    dir_path = Path(dir_path)
+    for file_path in sorted(dir_path.glob(pattern)):
+        compress_file(file_path)
+
+
+# ---------------------------------------------------------------------------
+# Mutation counting
+# ---------------------------------------------------------------------------
+
+def count_mutations(seq1: str, seq2: str) -> int:
+    """Count the number of positions where *seq1* and *seq2* differ.
+
+    Args:
+        seq1: First amino-acid sequence string.
+        seq2: Second amino-acid sequence string (must be same length as *seq1*).
+
+    Returns:
+        Integer count of mismatching positions.
+
+    Raises:
+        ValueError: If the sequences have different lengths.
+    """
+    if len(seq1) != len(seq2):
+        raise ValueError(
+            f"Sequences must have the same length ({len(seq1)} != {len(seq2)})"
+        )
+    return sum(a != b for a, b in zip(seq1, seq2))
+
+
+# ---------------------------------------------------------------------------
+# Batch inference helper
+# ---------------------------------------------------------------------------
+
+def group_by_length(
+    sequences: dict[str, str],
+    bucket_size: int = 10,
+) -> list[list[tuple[str, str]]]:
+    """Group sequences into length buckets for efficient GPU batching.
+
+    Sequences are sorted by length and then chunked into groups of
+    *bucket_size* so that each batch contains sequences of similar length,
+    reducing padding overhead.
+
+    Args:
+        sequences: Mapping of ``{sequence_id: sequence}`` strings.
+        bucket_size: Maximum number of sequences per bucket.
+
+    Returns:
+        List of buckets; each bucket is a list of ``(sequence_id, sequence)``
+        tuples sorted by ascending sequence length within the bucket.
+
+    Example::
+
+        buckets = group_by_length(seqs, bucket_size=8)
+        for batch in buckets:
+            run_batch(batch)
+    """
+    if not sequences:
+        return []
+
+    # Sort all entries by sequence length ascending
+    sorted_items = sorted(sequences.items(), key=lambda kv: len(kv[1]))
+
+    buckets: list[list[tuple[str, str]]] = []
+    for i in range(0, len(sorted_items), bucket_size):
+        buckets.append(sorted_items[i : i + bucket_size])
+
+    return buckets

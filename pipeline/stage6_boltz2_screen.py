@@ -17,8 +17,10 @@ import argparse
 import csv
 import json
 import math
+import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 try:
@@ -102,13 +104,140 @@ CSV_COLUMNS = [
     "product_affinity",
     "inhibition_ratio",
     "high_inhibition_risk",
+    "ts_affinity",
+    "ts_substrate_ratio",
     "pdb_path",
 ]
+
+# Timing constants (seconds per inference on RTX PRO 6000 Blackwell)
+VANILLA_INFERENCE_TIME_S = 18.0
+NIM_INFERENCE_TIME_S = 6.8
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+
+def write_checkpoint(checkpoint_path: Path, data: dict) -> None:
+    """Write checkpoint JSON atomically (write to .tmp then rename).
+
+    Args:
+        checkpoint_path: Path for the checkpoint JSON file.
+        data: Dict to serialize as JSON.
+    """
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=str(checkpoint_path.parent), suffix=".tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp_path, str(checkpoint_path))
+    except Exception:
+        # Clean up temp file on failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def load_checkpoint(checkpoint_path: Path) -> dict | None:
+    """Load checkpoint JSON if it exists.
+
+    Args:
+        checkpoint_path: Path to checkpoint JSON file.
+
+    Returns:
+        Parsed dict or None if no checkpoint exists.
+    """
+    if checkpoint_path.exists():
+        with open(checkpoint_path) as fh:
+            return json.load(fh)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Boltz-2 command builder
+# ---------------------------------------------------------------------------
+
+
+def _build_boltz_command(
+    boltz_bin: str,
+    input_path: Path,
+    output_dir: Path,
+    recycling_steps: int = 10,
+    num_seeds: int = 1,
+    use_nim: bool = False,
+) -> list[str]:
+    """Build the boltz predict command list.
+
+    Args:
+        boltz_bin: Name or path of the boltz binary.
+        input_path: Path to Boltz-2 input FASTA.
+        output_dir: Directory for Boltz-2 outputs.
+        recycling_steps: Number of recycling iterations.
+        num_seeds: Number of random seeds per prediction.
+        use_nim: If True, add --nim flag for NIM/TensorRT acceleration.
+
+    Returns:
+        List of command-line arguments for subprocess.run().
+    """
+    cmd = [
+        str(boltz_bin),
+        "predict",
+        str(input_path),
+        "--recycling_steps", str(recycling_steps),
+        "--num_seeds", str(num_seeds),
+        "--output_dir", str(output_dir),
+        "--use_msa_server", "false",
+    ]
+    if use_nim:
+        cmd.append("--nim")
+    return cmd
 
 
 # ---------------------------------------------------------------------------
 # Core functions
 # ---------------------------------------------------------------------------
+
+
+def run_ts_docking(
+    fasta_path: Path,
+    ts_smiles: str,
+    cofactors: list,
+    output_dir: Path,
+    recycling_steps: int = 10,
+    num_seeds: int = 1,
+    boltz_bin: str = "boltz",
+    use_nim: bool = False,
+) -> dict[str, float]:
+    """Run Boltz-2 with transition state analogue SMILES.
+
+    Args:
+        fasta_path: Path to FASTA with candidate sequences (top 50th percentile).
+        ts_smiles: SMILES string for the transition state analogue.
+        cofactors: List of cofactor name strings.
+        output_dir: Directory for TS docking outputs.
+        recycling_steps: Number of recycling iterations.
+        num_seeds: Number of random seeds per prediction.
+        boltz_bin: Name or path of the boltz binary.
+        use_nim: If True, use NIM/TensorRT acceleration.
+
+    Returns:
+        Dict mapping sequence_id -> ts_affinity score.
+    """
+    results = run_boltz2_screen(
+        fasta_path=fasta_path,
+        ligand_smiles=ts_smiles,
+        cofactors=cofactors,
+        output_dir=output_dir,
+        recycling_steps=recycling_steps,
+        num_seeds=num_seeds,
+        boltz_bin=boltz_bin,
+        use_nim=use_nim,
+    )
+    return {r["sequence_id"]: r.get("affinity", 0.0) for r in results}
 
 
 def run_boltz2_screen(
@@ -119,6 +248,7 @@ def run_boltz2_screen(
     recycling_steps: int = 10,
     num_seeds: int = 1,
     boltz_bin: str = "boltz",
+    use_nim: bool = False,
 ) -> list[dict]:
     """Run Boltz-2 on all sequences in a FASTA file (batch mode).
 
@@ -135,6 +265,7 @@ def run_boltz2_screen(
         recycling_steps: Number of recycling iterations.
         num_seeds: Number of random seeds per prediction.
         boltz_bin: Name or path of the boltz binary.
+        use_nim: If True, use NIM/TensorRT acceleration.
 
     Returns:
         List of dicts with keys: sequence_id, pdb_path, plddt, iptm, affinity.
@@ -169,15 +300,24 @@ def run_boltz2_screen(
         for cof in cofactors:
             fh.write(f">cofactor|{cof}\n{cof}\n")
 
-    cmd = [
-        str(boltz_bin),
-        "predict",
-        str(boltz_input),
-        "--recycling_steps", str(recycling_steps),
-        "--num_seeds", str(num_seeds),
-        "--output_dir", str(output_dir),
-        "--use_msa_server", "false",
-    ]
+    # Log timing estimate
+    n_seq = len(sequences)
+    t_per = NIM_INFERENCE_TIME_S if use_nim else VANILLA_INFERENCE_TIME_S
+    est_time = n_seq * t_per
+    mode_label = "NIM/TensorRT" if use_nim else "vanilla"
+    logger.info(
+        "Estimated time for %d sequences (%s): %.1f s (%.1f s/inference)",
+        n_seq, mode_label, est_time, t_per,
+    )
+
+    cmd = _build_boltz_command(
+        boltz_bin=boltz_bin,
+        input_path=boltz_input,
+        output_dir=output_dir,
+        recycling_steps=recycling_steps,
+        num_seeds=num_seeds,
+        use_nim=use_nim,
+    )
 
     logger.info("Running Boltz-2: %s", " ".join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -488,8 +628,12 @@ def run_stage(config: dict) -> dict:
     3. Apply structural filters
     4. Select top 50th percentile by substrate affinity
     5. Run product docking for top 50th percentile
-    6. Calculate inhibition ratios
-    7. Write results to screening_results.csv
+    6. Run TS docking for top 50th percentile (if ts_smiles configured)
+    7. Calculate inhibition ratios and TS/substrate ratios
+    8. Write results to screening_results.csv
+
+    Supports checkpoint/resume: after each enzyme completes, a checkpoint
+    JSON is written. On resume, already-completed enzymes are skipped.
 
     Args:
         config: Loaded pipeline configuration dictionary.
@@ -499,6 +643,7 @@ def run_stage(config: dict) -> dict:
             "total_candidates": int,
             "passed_filters": int,
             "product_docked": int,
+            "ts_docked": int,
             "high_inhibition_risk": int,
         }
     """
@@ -512,8 +657,10 @@ def run_stage(config: dict) -> dict:
     output_dir = base_dir / stage_cfg.get("output_dir", "stage_06_boltz2_screening")
     substrate_dock_dir = output_dir / "substrate_docking"
     product_dock_dir = output_dir / "product_docking"
+    ts_dock_dir = output_dir / "ts_docking"
     substrate_dock_dir.mkdir(parents=True, exist_ok=True)
     product_dock_dir.mkdir(parents=True, exist_ok=True)
+    ts_dock_dir.mkdir(parents=True, exist_ok=True)
 
     # Filter thresholds
     ca_rmsd_max = stage_cfg.get("ca_rmsd_max", 2.0)
@@ -525,6 +672,14 @@ def run_stage(config: dict) -> dict:
     num_seeds = stage_cfg.get("num_seeds", 1)
     boltz_bin = config.get("tools", {}).get("boltz_bin", "boltz")
 
+    # NIM/TensorRT config
+    use_nim = stage_cfg.get("use_nim", False)
+    if use_nim:
+        logger.info(
+            "NIM/TensorRT mode enabled (%.1f s/inference vs %.1f s vanilla)",
+            NIM_INFERENCE_TIME_S, VANILLA_INFERENCE_TIME_S,
+        )
+
     # Stage 5 input dir
     stage5_dir = base_dir / config.get("stages", {}).get(
         "stage_05_esmfold", {}
@@ -535,10 +690,27 @@ def run_stage(config: dict) -> dict:
         "stage_02_wt_structures", {}
     ).get("output_dir", "stage_02_wt_structures")
 
+    # ---- Checkpoint/resume ----
+    checkpoint_path = output_dir / "checkpoint.json"
+    checkpoint = load_checkpoint(checkpoint_path)
+    completed_enzymes: set[str] = set()
     all_rows: list[dict] = []
     summary: dict = {}
 
+    if checkpoint is not None:
+        completed_enzymes = set(checkpoint.get("completed_enzymes", []))
+        all_rows = checkpoint.get("rows", [])
+        summary = checkpoint.get("summary", {})
+        logger.info(
+            "Resuming from checkpoint: %d enzymes already completed",
+            len(completed_enzymes),
+        )
+
     for enzyme_id, enzyme_cfg in config["enzymes"].items():
+        if enzyme_id in completed_enzymes:
+            logger.info("Skipping %s (already completed in checkpoint)", enzyme_id)
+            continue
+
         logger.info("Processing %s (%s)", enzyme_id, enzyme_cfg.get("name", enzyme_id))
 
         # ---- Read filtered FASTA from Stage 5 ----
@@ -552,6 +724,7 @@ def run_stage(config: dict) -> dict:
 
         substrate_smiles = enzyme_cfg.get("substrate_smiles", "")
         product_smiles = enzyme_cfg.get("product_smiles", "")
+        ts_smiles = enzyme_cfg.get("ts_smiles", "")
         cofactors = enzyme_cfg.get("cofactors", [])
         hotspot_residues = enzyme_cfg.get("hotspot_residues", [])
 
@@ -574,6 +747,7 @@ def run_stage(config: dict) -> dict:
                 recycling_steps=recycling_steps,
                 num_seeds=num_seeds,
                 boltz_bin=boltz_bin,
+                use_nim=use_nim,
             )
         except RuntimeError as exc:
             logger.error("Substrate docking failed for %s: %s", enzyme_id, exc)
@@ -605,7 +779,7 @@ def run_stage(config: dict) -> dict:
             enzyme_id, len(filtered_results), len(substrate_results),
         )
 
-        # ---- Step 3: Select top 50th percentile for product docking ----
+        # ---- Step 3: Select top 50th percentile for product/TS docking ----
         top_candidates = select_top_percentile(filtered_results, percentile=50.0)
         top_seq_ids = {r["sequence_id"] for r in top_candidates}
 
@@ -636,17 +810,47 @@ def run_stage(config: dict) -> dict:
                         recycling_steps=recycling_steps,
                         num_seeds=num_seeds,
                         boltz_bin=boltz_bin,
+                        use_nim=use_nim,
                     )
                     for pr in product_results:
                         product_affinity_map[pr["sequence_id"]] = pr.get("affinity", 0.0)
                 except RuntimeError as exc:
                     logger.error("Product docking failed for %s: %s", enzyme_id, exc)
 
+        # ---- Step 4b: TS docking (top 50th percentile, if ts_smiles) ----
+        ts_affinity_map: dict[str, float] = {}
+        if ts_smiles and top_candidates:
+            logger.info("Running TS analogue docking for %s", enzyme_id)
+            all_seqs = read_fasta(fasta_path)
+            subset_seqs = {
+                sid: seq for sid, seq in all_seqs.items() if sid in top_seq_ids
+            }
+            if subset_seqs:
+                ts_fasta = ts_dock_dir / enzyme_id / f"{enzyme_id}_top50_ts.fasta"
+                ts_fasta.parent.mkdir(parents=True, exist_ok=True)
+                write_fasta(subset_seqs, ts_fasta)
+
+                try:
+                    ts_affinity_map = run_ts_docking(
+                        fasta_path=ts_fasta,
+                        ts_smiles=ts_smiles,
+                        cofactors=cofactors,
+                        output_dir=ts_dock_dir / enzyme_id,
+                        recycling_steps=recycling_steps,
+                        num_seeds=num_seeds,
+                        boltz_bin=boltz_bin,
+                        use_nim=use_nim,
+                    )
+                except RuntimeError as exc:
+                    logger.error("TS docking failed for %s: %s", enzyme_id, exc)
+
         # ---- Step 5: Calculate inhibition ratios and build CSV rows ----
         n_high_risk = 0
+        n_ts_docked = len(ts_affinity_map)
         for res in substrate_results:
             seq_id = res["sequence_id"]
             product_aff = product_affinity_map.get(seq_id)
+            ts_aff = ts_affinity_map.get(seq_id)
 
             if product_aff is not None:
                 inh_ratio = calculate_inhibition_ratio(
@@ -660,6 +864,13 @@ def run_stage(config: dict) -> dict:
             if high_risk:
                 n_high_risk += 1
 
+            # TS/substrate ratio
+            sub_aff = res.get("substrate_affinity", 0.0)
+            if ts_aff is not None and sub_aff != 0.0:
+                ts_sub_ratio = ts_aff / sub_aff
+            else:
+                ts_sub_ratio = None
+
             row = {
                 "sequence_id": seq_id,
                 "enzyme_id": enzyme_id,
@@ -672,6 +883,8 @@ def run_stage(config: dict) -> dict:
                 "product_affinity": product_aff if product_aff is not None else "",
                 "inhibition_ratio": inh_ratio if inh_ratio is not None else "",
                 "high_inhibition_risk": high_risk if high_risk is not None else "",
+                "ts_affinity": ts_aff if ts_aff is not None else "",
+                "ts_substrate_ratio": ts_sub_ratio if ts_sub_ratio is not None else "",
                 "pdb_path": res.get("pdb_path", ""),
             }
             all_rows.append(row)
@@ -680,17 +893,28 @@ def run_stage(config: dict) -> dict:
             "total_candidates": len(substrate_results),
             "passed_filters": len(filtered_results),
             "product_docked": len(product_affinity_map),
+            "ts_docked": n_ts_docked,
             "high_inhibition_risk": n_high_risk,
         }
 
         logger.info(
-            "%s: %d total, %d passed filters, %d product-docked, %d high inhibition risk",
+            "%s: %d total, %d passed filters, %d product-docked, %d TS-docked, %d high inhibition risk",
             enzyme_id,
             summary[enzyme_id]["total_candidates"],
             summary[enzyme_id]["passed_filters"],
             summary[enzyme_id]["product_docked"],
+            summary[enzyme_id]["ts_docked"],
             summary[enzyme_id]["high_inhibition_risk"],
         )
+
+        # ---- Write checkpoint after each enzyme ----
+        completed_enzymes.add(enzyme_id)
+        write_checkpoint(checkpoint_path, {
+            "completed_enzymes": sorted(completed_enzymes),
+            "rows": all_rows,
+            "summary": summary,
+        })
+        logger.info("Checkpoint saved after %s", enzyme_id)
 
     # ---- Write screening_results.csv ----
     csv_path = output_dir / "screening_results.csv"
@@ -702,6 +926,11 @@ def run_stage(config: dict) -> dict:
         logger.info("Wrote %d rows to %s", len(all_rows), csv_path)
     else:
         logger.warning("No results to write — screening_results.csv not created")
+
+    # Clean up checkpoint on successful completion
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        logger.info("Checkpoint removed (stage complete)")
 
     logger.info("Stage 6 complete. Summary: %s", summary)
     return summary

@@ -31,6 +31,7 @@ from pipeline.stage8_codon_opt import (
     optimize_sequence,
     add_flanking_sequences,
     generate_plate_map,
+    count_mutations_from_wt,
     run_stage,
     _reverse_complement,
 )
@@ -439,9 +440,11 @@ class TestAddFlankingSequences:
 # ---------------------------------------------------------------------------
 
 class TestGeneratePlateMap:
+    """Tests for the sequential layout (original behaviour, explicit layout_strategy)."""
+
     def test_assigns_96_wells(self):
         sequences = {f"seq_{i}": "ATG" * 10 for i in range(96)}
-        plate_map = generate_plate_map(sequences, "enzyme_A")
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
         assert len(plate_map) == 96
         wells = [row["well_position"] for row in plate_map]
         # First well should be A1
@@ -451,19 +454,19 @@ class TestGeneratePlateMap:
 
     def test_well_positions_unique(self):
         sequences = {f"seq_{i}": "ATG" * 10 for i in range(96)}
-        plate_map = generate_plate_map(sequences, "enzyme_A")
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
         wells = [row["well_position"] for row in plate_map]
         assert len(set(wells)) == 96
 
     def test_fewer_than_96(self):
         sequences = {f"seq_{i}": "ATG" * 10 for i in range(10)}
-        plate_map = generate_plate_map(sequences, "enzyme_A")
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
         assert len(plate_map) == 10
         assert plate_map[0]["well_position"] == "A1"
 
     def test_more_than_96(self):
         sequences = {f"seq_{i}": "ATG" * 10 for i in range(100)}
-        plate_map = generate_plate_map(sequences, "enzyme_A")
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
         assert len(plate_map) == 100
         # 97th sequence should be on plate 2, well A1
         assert plate_map[96]["plate_number"] == 2
@@ -471,7 +474,7 @@ class TestGeneratePlateMap:
 
     def test_plate_map_fields(self):
         sequences = {"seq_1": "ATGAAAGCT"}
-        plate_map = generate_plate_map(sequences, "enzyme_A")
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
         row = plate_map[0]
         assert row["enzyme_id"] == "enzyme_A"
         assert row["sequence_id"] == "seq_1"
@@ -482,7 +485,7 @@ class TestGeneratePlateMap:
     def test_well_ordering(self):
         """Wells go A1, A2, ..., A12, B1, B2, ..., H12."""
         sequences = {f"seq_{i}": "ATG" for i in range(24)}
-        plate_map = generate_plate_map(sequences, "enzyme_A")
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
         wells = [row["well_position"] for row in plate_map]
         # First 12 should be A1-A12
         assert wells[:12] == [f"A{c}" for c in range(1, 13)]
@@ -560,3 +563,335 @@ class TestHelpers:
 
     def test_translate_stops_at_stop_codon(self):
         assert translate_dna("ATGTAAATG") == "M"
+
+
+# ---------------------------------------------------------------------------
+# count_mutations_from_wt
+# ---------------------------------------------------------------------------
+
+class TestCountMutationsFromWT:
+    def test_identical_sequences_zero_mutations(self):
+        seq = "MKTLYKE"
+        assert count_mutations_from_wt(seq, seq) == 0
+
+    def test_single_mutation(self):
+        wt  = "MKTLYKE"
+        var = "MKTLYAE"  # K->A at position 5
+        assert count_mutations_from_wt(var, wt) == 1
+
+    def test_all_different(self):
+        wt  = "AAAA"
+        var = "CCCC"
+        assert count_mutations_from_wt(var, wt) == 4
+
+    def test_multiple_mutations(self):
+        wt  = "MKTLYKE"
+        var = "AKTAYKE"  # M->A (pos 0), L->A (pos 4)
+        assert count_mutations_from_wt(var, wt) == 2
+
+    def test_case_insensitive(self):
+        wt  = "MKTLYKE"
+        var = "mktlyke"
+        assert count_mutations_from_wt(var, wt) == 0
+
+    def test_empty_sequences(self):
+        assert count_mutations_from_wt("", "") == 0
+
+    def test_different_lengths_counts_by_shorter(self):
+        """Positions beyond the shorter sequence are not counted."""
+        wt  = "MKTLYKE"
+        var = "MKT"
+        # Only first 3 positions compared: M=M, K=K, T=T => 0 mutations
+        assert count_mutations_from_wt(var, wt) == 0
+
+    def test_wt_shorter_than_variant(self):
+        wt  = "MKT"
+        var = "MKA"  # T->A at position 2
+        assert count_mutations_from_wt(var, wt) == 1
+
+
+# ---------------------------------------------------------------------------
+# generate_plate_map — sequential layout (backward compatibility)
+# ---------------------------------------------------------------------------
+
+class TestGeneratePlateMapSequential:
+    """Confirm the old sequential behaviour still works when explicitly requested."""
+
+    def test_sequential_fills_a1_to_h12(self):
+        sequences = {f"seq_{i}": "ATG" * 10 for i in range(96)}
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
+        wells = [row["well_position"] for row in plate_map]
+        assert wells[0] == "A1"
+        assert wells[-1] == "H12"
+
+    def test_sequential_well_ordering(self):
+        sequences = {f"seq_{i}": "ATG" for i in range(24)}
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
+        wells = [row["well_position"] for row in plate_map]
+        assert wells[:12] == [f"A{c}" for c in range(1, 13)]
+        assert wells[12:24] == [f"B{c}" for c in range(1, 13)]
+
+    def test_sequential_no_mutation_count_column(self):
+        """Sequential layout does not add mutation_count / risk_tier columns."""
+        sequences = {"seq_0": "ATG" * 10}
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
+        assert "mutation_count" not in plate_map[0]
+        assert "risk_tier" not in plate_map[0]
+
+
+# ---------------------------------------------------------------------------
+# generate_plate_map — hedging layout
+# ---------------------------------------------------------------------------
+
+class TestGeneratePlateMapHedging:
+    """Tests for the expression-hedging layout strategy."""
+
+    def _make_sequences_with_wt_info(self):
+        """
+        Build a dict of {seq_id: (dna_seq, protein_seq, pareto_rank)} and a
+        wt_sequence string so we have explicit control over mutation counts.
+        """
+        wt = "MKTLYKE"
+        variants = {
+            "wt":          (wt, 0, 1),
+            "var_cons1":   ("MKTLYKK", 1, 2),   # 1 mutation — conservative
+            "var_cons2":   ("MKTLYKR", 1, 3),   # 1 mutation — conservative
+            "var_mod1":    ("MKTAAKE", 2, 1),   # 2 mutations — moderate
+            "var_mod2":    ("MKTLAAE", 2, 2),   # 2 mutations — moderate
+            "var_mod3":    ("MKTLARA", 2, 3),   # 2 mutations — moderate
+            "var_agg1":    ("AKTARAK", 4, 1),   # 4 mutations — aggressive
+            "var_agg2":    ("AKTARAA", 4, 2),   # 4 mutations — aggressive
+        }
+        # Return as (sequences dict, variant_info dict, wt_sequence)
+        seqs = {k: "ATG" * 10 for k in variants}
+        return seqs, variants, wt
+
+    # -- WT controls -----------------------------------------------------------
+
+    def test_wt_in_a1(self):
+        """WT control must occupy well A1."""
+        sequences = {"wt": "ATG" * 10, "var1": "ATG" * 11, "var2": "ATG" * 12}
+        wt_seq = "MKTLYKE"
+        variant_info = {
+            "wt":   ("MKTLYKE", 0, 1),
+            "var1": ("MKTLYKK", 1, 2),
+            "var2": ("MKTLYKR", 2, 3),
+        }
+        plate_map = generate_plate_map(
+            sequences, "enzyme_A",
+            layout_strategy="hedging",
+            variant_info=variant_info,
+            wt_sequence=wt_seq,
+        )
+        a1 = next(r for r in plate_map if r["well_position"] == "A1")
+        assert a1["sequence_id"] == "wt"
+
+    def test_wt_in_h12(self):
+        """WT control must also occupy well H12 on the first plate."""
+        # Need enough sequences to fill up to H12
+        sequences = {f"var_{i}": "ATG" * 10 for i in range(94)}
+        sequences["wt_h12"] = "ATG" * 10
+        wt_seq = "MKTLYKE"
+        # Build variant_info: wt_h12 has 0 mutations, others have varying counts
+        variant_info: dict[str, tuple[str, int, int]] = {
+            f"var_{i}": ("MKTLYKK", (i % 4) + 1, i + 1)
+            for i in range(94)
+        }
+        variant_info["wt_h12"] = ("MKTLYKE", 0, 1)
+        plate_map = generate_plate_map(
+            sequences, "enzyme_A",
+            layout_strategy="hedging",
+            variant_info=variant_info,
+            wt_sequence=wt_seq,
+        )
+        h12_entries = [r for r in plate_map if r["well_position"] == "H12" and r["plate_number"] == 1]
+        assert len(h12_entries) == 1
+        assert h12_entries[0]["sequence_id"] == "wt_h12"
+
+    def test_hedging_adds_mutation_count_column(self):
+        sequences = {"wt": "ATG" * 10, "var1": "ATG" * 11}
+        variant_info = {
+            "wt":   ("MKTLYKE", 0, 1),
+            "var1": ("MKTLYKK", 1, 2),
+        }
+        plate_map = generate_plate_map(
+            sequences, "enzyme_A",
+            layout_strategy="hedging",
+            variant_info=variant_info,
+            wt_sequence="MKTLYKE",
+        )
+        for row in plate_map:
+            assert "mutation_count" in row
+
+    def test_hedging_adds_risk_tier_column(self):
+        sequences = {"wt": "ATG" * 10, "var1": "ATG" * 11}
+        variant_info = {
+            "wt":   ("MKTLYKE", 0, 1),
+            "var1": ("MKTLYKK", 1, 2),
+        }
+        plate_map = generate_plate_map(
+            sequences, "enzyme_A",
+            layout_strategy="hedging",
+            variant_info=variant_info,
+            wt_sequence="MKTLYKE",
+        )
+        for row in plate_map:
+            assert "risk_tier" in row
+            assert row["risk_tier"] in {"conservative", "moderate", "aggressive"}
+
+    # -- Risk tier assignment --------------------------------------------------
+
+    def test_risk_tier_thresholds(self):
+        """
+        Bottom 25% -> conservative, middle 50% -> moderate, top 25% -> aggressive.
+        Use 8 non-WT variants with mutation counts 1-8 for clean percentile splits.
+        An explicit WT (mutation_count=0) is supplied so none of the 8 variants
+        is co-opted as a WT control.
+        """
+        wt_seq = "MKTLYKE"
+        # 8 variants with mutation counts 1..8 + 1 WT (mutation_count=0)
+        sequences = {"wt": "ATG" * 10}
+        sequences.update({f"var_{i}": "ATG" * 10 for i in range(1, 9)})
+        variant_info: dict[str, tuple[str, int, int]] = {"wt": (wt_seq, 0, 0)}
+        variant_info.update({
+            f"var_{i}": (wt_seq[:i] + "A" * i, i, i)  # placeholder protein, i mutations, pareto rank i
+            for i in range(1, 9)
+        })
+        plate_map = generate_plate_map(
+            sequences, "enzyme_A",
+            layout_strategy="hedging",
+            variant_info=variant_info,
+            wt_sequence=wt_seq,
+        )
+        # Build tier map only for non-WT variant entries (WT appears in A1/H12)
+        tier_map = {
+            r["sequence_id"]: r["risk_tier"]
+            for r in plate_map
+            if r["sequence_id"] != "wt"
+        }
+        # Bottom 25% (2 out of 8): var_1, var_2 -> conservative
+        assert tier_map["var_1"] == "conservative"
+        assert tier_map["var_2"] == "conservative"
+        # Middle 50% (4 out of 8): var_3 .. var_6 -> moderate
+        assert tier_map["var_3"] == "moderate"
+        assert tier_map["var_6"] == "moderate"
+        # Top 25% (2 out of 8): var_7, var_8 -> aggressive
+        assert tier_map["var_7"] == "aggressive"
+        assert tier_map["var_8"] == "aggressive"
+
+    # -- Row grouping ----------------------------------------------------------
+
+    def test_conservative_variants_in_rows_a_b(self):
+        """Conservative variants (excl. WT controls) go in rows A-B."""
+        wt_seq = "MKTLYKE"
+        sequences = {f"var_{i}": "ATG" * 10 for i in range(1, 9)}
+        variant_info = {f"var_{i}": (wt_seq, i, i) for i in range(1, 9)}
+        plate_map = generate_plate_map(
+            sequences, "enzyme_A",
+            layout_strategy="hedging",
+            variant_info=variant_info,
+            wt_sequence=wt_seq,
+        )
+        conservative_rows = {
+            r["well_position"][0]
+            for r in plate_map
+            if r["risk_tier"] == "conservative"
+        }
+        assert conservative_rows.issubset({"A", "B"})
+
+    def test_moderate_variants_in_rows_c_to_f(self):
+        """Moderate variants go in rows C-F."""
+        wt_seq = "MKTLYKE"
+        sequences = {f"var_{i}": "ATG" * 10 for i in range(1, 9)}
+        variant_info = {f"var_{i}": (wt_seq, i, i) for i in range(1, 9)}
+        plate_map = generate_plate_map(
+            sequences, "enzyme_A",
+            layout_strategy="hedging",
+            variant_info=variant_info,
+            wt_sequence=wt_seq,
+        )
+        moderate_rows = {
+            r["well_position"][0]
+            for r in plate_map
+            if r["risk_tier"] == "moderate"
+        }
+        assert moderate_rows.issubset({"C", "D", "E", "F"})
+
+    def test_aggressive_variants_in_rows_g_h(self):
+        """Aggressive variants (excl. H12 WT control) go in rows G-H."""
+        wt_seq = "MKTLYKE"
+        sequences = {f"var_{i}": "ATG" * 10 for i in range(1, 9)}
+        variant_info = {f"var_{i}": (wt_seq, i, i) for i in range(1, 9)}
+        plate_map = generate_plate_map(
+            sequences, "enzyme_A",
+            layout_strategy="hedging",
+            variant_info=variant_info,
+            wt_sequence=wt_seq,
+        )
+        aggressive_rows = {
+            r["well_position"][0]
+            for r in plate_map
+            if r["risk_tier"] == "aggressive"
+        }
+        assert aggressive_rows.issubset({"G", "H"})
+
+    # -- Pareto rank sorting within tier ---------------------------------------
+
+    def test_pareto_sort_within_tier(self):
+        """Within each risk tier, variants are sorted by Pareto rank (ascending = best first)."""
+        wt_seq = "MKTLYKE"
+        # 4 moderate variants with Pareto ranks out of order
+        sequences = {
+            "cons1": "ATG" * 10,
+            "mod_rank3": "ATG" * 10,
+            "mod_rank1": "ATG" * 10,
+            "mod_rank2": "ATG" * 10,
+            "agg1": "ATG" * 10,
+        }
+        variant_info = {
+            "cons1":     (wt_seq, 1, 1),
+            "mod_rank3": (wt_seq, 3, 3),
+            "mod_rank1": (wt_seq, 3, 1),
+            "mod_rank2": (wt_seq, 3, 2),
+            "agg1":      (wt_seq, 5, 1),
+        }
+        plate_map = generate_plate_map(
+            sequences, "enzyme_A",
+            layout_strategy="hedging",
+            variant_info=variant_info,
+            wt_sequence=wt_seq,
+        )
+        moderate_entries = [r for r in plate_map if r["risk_tier"] == "moderate"]
+        pareto_ranks = [r["pareto_rank"] for r in moderate_entries]
+        assert pareto_ranks == sorted(pareto_ranks)
+
+    # -- Default strategy is hedging ------------------------------------------
+
+    def test_default_strategy_is_hedging(self):
+        """Calling generate_plate_map without layout_strategy should use hedging."""
+        sequences = {"wt": "ATG" * 10, "var1": "ATG" * 11}
+        variant_info = {
+            "wt":   ("MKTLYKE", 0, 1),
+            "var1": ("MKTLYKK", 1, 2),
+        }
+        plate_map = generate_plate_map(
+            sequences, "enzyme_A",
+            variant_info=variant_info,
+            wt_sequence="MKTLYKE",
+        )
+        # Hedging layout includes risk_tier column
+        assert "risk_tier" in plate_map[0]
+
+    # -- Existing sequential tests still pass ----------------------------------
+
+    def test_sequential_still_assigns_96_wells(self):
+        sequences = {f"seq_{i}": "ATG" * 10 for i in range(96)}
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
+        assert len(plate_map) == 96
+
+    def test_sequential_first_last_wells(self):
+        sequences = {f"seq_{i}": "ATG" * 10 for i in range(96)}
+        plate_map = generate_plate_map(sequences, "enzyme_A", layout_strategy="sequential")
+        wells = [r["well_position"] for r in plate_map]
+        assert wells[0] == "A1"
+        assert wells[-1] == "H12"

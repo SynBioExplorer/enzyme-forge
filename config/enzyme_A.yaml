@@ -8,6 +8,7 @@ length: 428
 sequence_file: "inputs/sequences/enzyme_A.fasta"
 substrate_smiles: "REPLACE_WITH_SUBSTRATE_SMILES"
 product_smiles: "REPLACE_WITH_PRODUCT_SMILES"
+ts_smiles: ""                     # Optional: transition state analogue SMILES
 
 # Catalytic residues to keep fixed during LigandMPNN design
 fixed_residues: []

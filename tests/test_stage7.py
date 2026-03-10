@@ -192,6 +192,8 @@ class TestModuleConstants:
             "catpred_kcat",
             "boltz2_substrate_affinity",
             "md_stability_rmsd",
+            "ts_affinity",
+            "ts_substrate_ratio",
         }
         assert expected_metrics == set(METRIC_DIRECTIONS.keys())
 
