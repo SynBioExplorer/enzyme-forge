@@ -1,0 +1,11 @@
+literature/
+*.pptx
+*.pdf
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+.worktrees/
+databases/
